@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BOSS直聘自动沟通助手
 // @namespace    local.codex.zhipin
-// @version      0.1.8
+// @version      0.1.9
 // @description  在 BOSS 直聘搜索结果页自动选择岗位、发送常用语或自定义问候语，并记录岗位数据。
 // @match        https://www.zhipin.com/web/geek/jobs*
 // @match        https://www.zhipin.com/web/geek/chat*
@@ -19,6 +19,7 @@
  * - 面板在岗位列表页 `/web/geek/jobs` 的全部子路由和聊天页 `/web/geek/chat` 显示。
  * - 主流程：岗位列表选择岗位 -> 点击沟通按钮 -> 进入聊天页 -> 发送常用语或自定义文本 -> 返回岗位列表继续。
  * - 支持随机时间间隔、聊天/列表等待上限、已沟通跳过、岗位沟通记录导出与清理。
+ * - 列表耗尽后可自动刷新页面续跑；沟通次数提醒弹窗会自动点击确定，硬限制则暂停。
  * - 岗位记录存储在浏览器 IndexedDB，运行状态存储在 localStorage，用于跨页面跳转后恢复自动化。
  *
  * 维护定位：
@@ -37,7 +38,7 @@
   // 全局常量：集中维护脚本版本、存储 key、BOSS 接口特征和默认问候语。
   const APP = {
     name: 'BOSS自动沟通',
-    version: '0.1.8',
+    version: '0.1.9',
     dbName: 'ZhipinAutoGreetingDB',
     dbVersion: 1,
     configKey: '__zhipin_auto_greeting_config__',
@@ -107,6 +108,9 @@
     skipContacted: true,
     collectGreetedJobs: true,
     ignoreListRefresh: true,
+    // 当前列表扫完后是否整页刷新续跑；刷新次数上限 0 表示不限制。
+    autoRefreshOnExhausted: true,
+    maxListRefresh: 5,
     delayMin: 4,
     delayMax: 8,
     waitTimeout: 5,
@@ -152,6 +156,7 @@
     jobListResourceObserver: null,
     initialPageUrl: location.href,
     latestRouteUrl: location.href,
+    lastBossDialogDismissAt: 0,
     debugEvents: [],
     // 已沟通 Set 是 IndexedDB 的内存投影，用于列表循环中快速判重。
     contactedJobKeys: new Set(),
@@ -2661,12 +2666,14 @@
             <label class="za-check"><input data-field="skipContacted" type="checkbox"> 跳过已沟通 HR</label>
             <label class="za-check"><input data-field="collectGreetedJobs" type="checkbox"> 收集已打招呼岗位信息</label>
             <label class="za-check"><input data-field="ignoreListRefresh" type="checkbox"> 无视列表刷新</label>
+            <label class="za-check"><input data-field="autoRefreshOnExhausted" type="checkbox"> 列表耗尽后自动刷新</label>
             <div class="za-grid-2">
               <label>最小间隔(秒)<input data-field="delayMin" type="number" min="1" step="1"></label>
               <label>最大间隔(秒)<input data-field="delayMax" type="number" min="1" step="1"></label>
               <label>等待上限(秒)<input data-field="waitTimeout" type="number" min="2" step="1"></label>
               <label>聊天重试次数<input data-field="chatOpenRetries" type="number" min="0" step="1"></label>
               <label>最大沟通数<input data-field="maxCount" type="number" min="0" step="1"></label>
+              <label>列表刷新上限<input data-field="maxListRefresh" type="number" min="0" step="1" title="当前列表耗尽后最多整页刷新次数，0 表示不限制"></label>
             </div>
           </section>
 
@@ -4132,6 +4139,7 @@
         pauseReason: '',
         listSnapshot: createJobListSnapshot(),
         chatOpenRetryCount: 0,
+        listRefreshCount: 0,
         startedAt: nowIso(),
       });
 
@@ -4234,6 +4242,9 @@
           const processed = await this.processNextCard(state);
           if (processed === 'navigating') return;
           if (processed === 'done') {
+            // 当前虚拟列表扫完后可整页刷新续跑；达到刷新上限或关闭开关时才真正停止。
+            const refreshed = await this.refreshListAfterExhausted();
+            if (refreshed) return;
             this.stop('没有更多符合条件的岗位');
             break;
           }
@@ -4531,8 +4542,15 @@
     },
 
     // 同时覆盖 SPA 跳转和完整文档导航；pagehide 会在 BFCache 冻结计时器前完成清理。
+    // 点击沟通后若出现沟通次数提醒弹窗，会先点确定，避免一直等到聊天页超时。
     watchChatPageTransition(job) {
-      waitFor(() => isChatPage() ? 'same-page' : null, getWaitTimeout(), '聊天页跳转', {
+      waitFor(() => {
+        const dialog = inspectBossPlatformDialog({ dismissSoft: true });
+        if (dialog && dialog.kind === 'hard_limit') {
+          throw createPauseError(formatBossDialogPauseMessage(dialog));
+        }
+        return isChatPage() ? 'same-page' : null;
+      }, getWaitTimeout(), '聊天页跳转', {
         observerRoot: getPageObserverRoot(),
         childList: true,
         subtree: true,
@@ -4559,12 +4577,30 @@
         }
       }).catch((error) => {
         const latestState = RunState.load();
+        if (error && error.zhipinAutoPause) {
+          runtime.automationLoopActive = false;
+          this.pause(error.message || '已暂停');
+          return;
+        }
+
+        // 超时前再尝试关闭一次软提醒弹窗；关闭后若仍停留在列表页，交给聊天重试机制。
+        const dialog = inspectBossPlatformDialog({ dismissSoft: true });
         logDebugEvent('chat_page_transition_timeout', {
           message: error && error.message || String(error),
           href: location.href,
           job: summarizeJobForDebug(job),
           runState: latestState,
+          dialog: dialog && {
+            kind: dialog.kind,
+            text: summarizeLongText(dialog.text),
+          },
         }, 'warn');
+
+        if (dialog && dialog.kind === 'hard_limit') {
+          runtime.automationLoopActive = false;
+          this.pause(formatBossDialogPauseMessage(dialog));
+          return;
+        }
 
         // 点击未触发导航时交给现有的聊天渲染/重新点击机制处理，不再直接 fatal 停机。
         if (latestState && latestState.active && latestState.phase === 'chat' && latestState.pendingJob && isJobListRoute()) {
@@ -4621,6 +4657,12 @@
           listState: getDebugListState(),
         });
         UI.setStatus(`聊天页发送中：${pendingJob.jobName || '未知岗位'}`, 'info');
+
+        // 进入聊天发送前先消掉可能残留的沟通提醒弹窗，避免输入框等待被挡住。
+        const dialog = inspectBossPlatformDialog({ dismissSoft: true });
+        if (dialog && dialog.kind === 'hard_limit') {
+          throw createPauseError(formatBossDialogPauseMessage(dialog));
+        }
 
         const sendResult = await this.sendCurrentWithChatOpenRetries(pendingJob, state);
         // 只有发送确认通过后才写入 sent，并同步更新已沟通列表。
@@ -4681,6 +4723,11 @@
           }, 'warn');
 
           if (!isChatRenderTimeoutError(error) || attempts >= maxRetries) {
+            // 最后一次聊天超时时再尝试关闭软提醒；硬限制转暂停而不是 fatal。
+            const dialog = inspectBossPlatformDialog({ dismissSoft: true });
+            if (dialog && dialog.kind === 'hard_limit') {
+              throw createPauseError(formatBossDialogPauseMessage(dialog));
+            }
             throw error;
           }
 
@@ -4906,6 +4953,59 @@
       if (!completed) return;
 
       RunState.patch({ nextRunAt: null, nextDelaySeconds: null });
+    },
+
+    // 当前列表无可沟通岗位时整页刷新续跑；依赖 RunState.active 在刷新后由 resumeIfNeeded 接上。
+    async refreshListAfterExhausted() {
+      if (!config.autoRefreshOnExhausted) return false;
+
+      const state = RunState.load() || {};
+      const refreshCount = Math.max(0, Number(state.listRefreshCount || 0));
+      const maxRefresh = Math.max(0, Number(config.maxListRefresh || 0));
+      if (maxRefresh > 0 && refreshCount >= maxRefresh) {
+        UI.setStatus(`已达到列表刷新上限：${maxRefresh}`, 'warn');
+        logDebugEvent('list_exhausted_refresh_limit', { refreshCount, maxRefresh }, 'warn');
+        return false;
+      }
+
+      const nextCount = refreshCount + 1;
+      const limitLabel = maxRefresh > 0 ? `${nextCount}/${maxRefresh}` : String(nextCount);
+      UI.setStatus(`当前列表已处理完，正在刷新页面继续（${limitLabel}）...`, 'warn');
+      logDebugEvent('list_exhausted_refresh', {
+        refreshCount: nextCount,
+        maxRefresh,
+        processedCount: Array.isArray(state.processedKeys) ? state.processedKeys.length : 0,
+        listUrl: state.listUrl,
+      });
+
+      // 清空本轮扫描进度，保留筛选 URL / 求职期望 / sentCount；已沟通去重仍靠 ContactedIndex。
+      RunState.patch({
+        active: true,
+        phase: 'list',
+        listRefreshCount: nextCount,
+        processedKeys: [],
+        scanPhase: 'seeking_top',
+        scanNoProgressCount: 0,
+        scanDiscoveredCount: 0,
+        cursorIndex: 0,
+        pendingJob: null,
+        pendingJobKey: '',
+        pendingRawJob: null,
+        chatButtonText: '',
+        chatOpenRetryCount: 0,
+        returnAttempts: 0,
+        returnStartedAt: null,
+        nextRunAt: null,
+        nextDelaySeconds: null,
+        listSnapshot: createJobListSnapshot(),
+        stopReason: '',
+        pauseReason: '',
+      });
+
+      runtime.stopRequested = false;
+      await sleep(600);
+      location.reload();
+      return true;
     },
 
     // 统一停机入口：写停止状态、解锁 UI，并锁定错误提示。
@@ -6434,12 +6534,111 @@
     return error;
   }
 
+  // 识别 BOSS 沟通相关平台弹窗（温馨提示 / 次数用尽等），排除脚本自己的确认框。
+  function findBossPlatformDialog() {
+    const selectorRoots = Array.from(document.querySelectorAll([
+      '[role="dialog"]',
+      '.dialog-wrap',
+      '.boss-dialog',
+      '.common-dialog',
+      '.dialog-container',
+      '.dialog-layer',
+      '.boss-popup',
+      '.confirm-dialog',
+      '.ui-dialog',
+    ].join(','))).filter((element) => !isOwnUiElement(element) && isVisible(element));
+
+    // 部分弹窗没有稳定 class，退回扫描看起来像浮层的节点，避免误伤整页容器。
+    const overlayRoots = Array.from(document.querySelectorAll('body > div, .dialog, .popup, .modal'))
+      .filter((element) => {
+        if (isOwnUiElement(element) || !isVisible(element)) return false;
+        if (selectorRoots.includes(element)) return false;
+        const style = getComputedStyle(element);
+        const position = style.position;
+        const zIndex = Number(style.zIndex || 0);
+        return (position === 'fixed' || position === 'absolute') && (zIndex >= 10 || style.backgroundColor !== 'rgba(0, 0, 0, 0)');
+      });
+
+    const roots = selectorRoots.concat(overlayRoots);
+    let best = null;
+    for (const root of roots) {
+      const text = normalizeText(root.innerText || root.textContent || '');
+      if (!text || text.length < 6 || text.length > 500) continue;
+
+      const softReminder = /温馨提示/.test(text) && /沟通/.test(text)
+        || /还剩\s*\d+\s*次沟通/.test(text)
+        || /您今天已与\s*\d+\s*位/.test(text)
+        || /沟通机会/.test(text) && /今天已与|还剩/.test(text);
+      const hardLimit = /今日沟通(?:次数)?已(?:用完|达上限)|沟通次数(?:已)?(?:用完|达上限)|无法继续沟通|今日无法再沟通|已达(?:到)?沟通上限/.test(text);
+      if (!softReminder && !hardLimit) continue;
+
+      const buttons = Array.from(root.querySelectorAll('button, a, [role="button"], .btn, [class*="btn"]'))
+        .filter((button) => !isOwnUiElement(button) && isVisible(button));
+      const confirmButton = buttons.find((button) => {
+        const label = normalizeText(button.innerText || button.textContent || button.getAttribute('aria-label') || '');
+        return /^(确定|知道了|我知道了|继续|关闭)$/.test(label);
+      }) || buttons.find((button) => {
+        const label = normalizeText(button.innerText || button.textContent || button.getAttribute('aria-label') || '');
+        return /确定|知道了|我知道了/.test(label) && !/取消|开通|升级|购买|查看权益/.test(label);
+      });
+
+      const score = (hardLimit ? 4 : 0) + (softReminder ? 2 : 0) + (confirmButton ? 1 : 0) + Math.min(text.length, 80) / 80;
+      if (!best || score > best.score) {
+        best = {
+          root,
+          text,
+          kind: hardLimit ? 'hard_limit' : 'soft_reminder',
+          confirmButton: confirmButton || null,
+          score,
+        };
+      }
+    }
+
+    return best;
+  }
+
+  // 生成沟通上限暂停文案，避免把整段弹窗原文塞进状态栏。
+  function formatBossDialogPauseMessage(dialog) {
+    const text = normalizeText(dialog && dialog.text || '');
+    const short = text.length > 60 ? `${text.slice(0, 60)}...` : text;
+    return short ? `沟通受限，已暂停：${short}` : '沟通次数已达上限，已暂停';
+  }
+
+  // 检查并处理平台弹窗：软提醒可点击确定；硬限制只返回结果，由调用方 pause。
+  function inspectBossPlatformDialog(options) {
+    const settings = options || {};
+    const dialog = findBossPlatformDialog();
+    if (!dialog) return null;
+
+    if (dialog.kind === 'soft_reminder' && settings.dismissSoft && dialog.confirmButton) {
+      const lastAt = Number(runtime.lastBossDialogDismissAt || 0);
+      if (Date.now() - lastAt > 900) {
+        UI.setStatus('检测到沟通提醒弹窗，正在点击确定...', 'warn');
+        logDebugEvent('boss_platform_dialog_dismiss', {
+          kind: dialog.kind,
+          text: summarizeLongText(dialog.text),
+          buttonText: normalizeText(dialog.confirmButton.innerText || dialog.confirmButton.textContent || ''),
+        });
+        clickElement(dialog.confirmButton);
+        runtime.lastBossDialogDismissAt = Date.now();
+      }
+    } else if (dialog.kind === 'hard_limit') {
+      logDebugEvent('boss_platform_dialog_hard_limit', {
+        kind: dialog.kind,
+        text: summarizeLongText(dialog.text),
+      }, 'warn');
+    }
+
+    return dialog;
+  }
+
   // 聊天页输入框长期不出现时，允许走重新点击沟通的重试路径。
   function isChatRenderTimeoutError(error) {
     return Boolean(error && /聊天界面渲染\s*等待超时/.test(String(error.message || error)));
   }
 
   // 等待聊天页关键区域就绪：输入框、会话列表、当前会话匹配。
+  // 等待过程中若出现沟通次数提醒弹窗，先点确定；硬限制则暂停。
   function waitForChatReady(job) {
     logDebugEvent('wait_chat_ready_start', {
       job: summarizeJobForDebug(job),
@@ -6450,6 +6649,11 @@
       runState: RunState.load(),
     });
     return waitFor(() => {
+      const dialog = inspectBossPlatformDialog({ dismissSoft: true });
+      if (dialog && dialog.kind === 'hard_limit') {
+        throw createPauseError(formatBossDialogPauseMessage(dialog));
+      }
+
       if (!/\/chat\b|\/web\/geek\/chat/.test(location.pathname + location.hash) && !document.querySelector('.chat-input')) {
         return null;
       }
@@ -7879,6 +8083,11 @@
 
     if (min > max) return '最小间隔不能大于最大间隔';
     if (!Number.isFinite(wait) || wait < 2) return '等待上限不能小于 2 秒';
+
+    const maxListRefresh = Number(config.maxListRefresh);
+    if (!Number.isFinite(maxListRefresh) || maxListRefresh < 0) {
+      return '列表刷新上限不能小于 0';
+    }
 
     if (config.companyFilterMode === 'regex' && config.companyFilterValue) {
       try {

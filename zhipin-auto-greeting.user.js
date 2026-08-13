@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BOSS直聘自动沟通助手
 // @namespace    local.codex.zhipin
-// @version      0.1.10
+// @version      0.1.12
 // @description  在 BOSS 直聘搜索结果页自动选择岗位、发送常用语或自定义问候语，并记录岗位数据。
 // @match        https://www.zhipin.com/web/geek/jobs*
 // @match        https://www.zhipin.com/web/geek/chat*
@@ -38,7 +38,8 @@
   // 全局常量：集中维护脚本版本、存储 key、BOSS 接口特征和默认问候语。
   const APP = {
     name: 'BOSS自动沟通',
-    version: '0.1.9',
+    version: '0.1.12',
+    githubVersionUrl: 'https://raw.githubusercontent.com/agarcabin/boss-auto-greeting/main/zhipin-auto-greeting.user.js',
     dbName: 'ZhipinAutoGreetingDB',
     dbVersion: 1,
     configKey: '__zhipin_auto_greeting_config__',
@@ -52,6 +53,7 @@
     sheetJsUrl: 'https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js',
     defaultGreetingText: '您好，我对这个岗位比较感兴趣，希望可以进一步沟通，谢谢。',
     storageQuotaWarnRatio: 0.9,
+    dailyDeliveryLimit: 150,
   };
 
   // unsafeWindow 是篡改猴注入到页面真实环境的 window；优先用它才能拦截页面自己的 fetch/XHR/history。
@@ -78,11 +80,11 @@
     { id: 'strategy', title: '运行策略', defaultEnabled: true, readonly: true },
     { id: 'companyFilter', title: '公司筛选', defaultEnabled: true },
     { id: 'companyBlacklist', title: '公司黑名单', defaultEnabled: true },
-    { id: 'bossActive', title: 'Boss活跃度筛选', defaultEnabled: true },
     { id: 'export', title: '数据导出', defaultEnabled: true },
     { id: 'cleanup', title: '数据清理', defaultEnabled: true },
     { id: 'debugLog', title: '调试日志', defaultEnabled: false },
     { id: 'greetedList', title: '已沟通列表', defaultEnabled: true },
+    { id: 'about', title: '关于', defaultEnabled: true },
   ];
   const FEATURE_BLOCK_ID_SET = new Set(FEATURE_BLOCK_DEFINITIONS.map((item) => item.id));
 
@@ -117,13 +119,23 @@
     chatOpenRetries: 2,
     maxCount: 0,
     // 岗位名称/薪资过滤和数据维护选项。
+    // 名称类筛选统一使用部分匹配；保留字段仅用于兼容旧版配置。
     jobNameFilterMode: 'partial',
     jobNameFilterValue: '',
     salaryMin: '',
     salaryMax: '',
+    unknownSalaryAction: 'ignore',
     companyBlacklistMode: 'partial',
     companyBlacklistValue: '',
     companyBlacklistRules: [],
+    jobNameBlacklistMode: 'partial',
+    jobNameBlacklistValue: '双休，工资，急，高薪',
+    jobNameBlacklistRules: ['双休', '工资', '急', '高薪'],
+    jdBlacklistMode: 'partial',
+    jdBlacklistValue: '合伙，押金，保证金，培训费，代理加盟，刷单，垫资',
+    jdBlacklistRules: ['合伙', '押金', '保证金', '培训费', '代理加盟', '刷单', '垫资'],
+    // 黑名单配置迁移版本：2 表示已将旧公司黑名单并入名称黑名单。
+    blacklistDefaultsVersion: 2,
     bossActiveFilterValues: [],
     bossActiveCustomOptions: [],
     exportType: 'json',
@@ -170,10 +182,13 @@
     statusLock: null,
     jobNameFilterEdited: false,
     configFormTouched: false,
+    lastSkipReason: '',
     // 外部库、UI 和数据库连接缓存。
     xlsx: null,
     ui: null,
     db: null,
+    latestVersion: '',
+    latestVersionRequest: null,
   };
 
   let config = loadConfig();
@@ -213,7 +228,38 @@
   function loadConfig() {
     try {
       const stored = JSON.parse(localStorage.getItem(APP.configKey) || '{}');
-      return repairLoadedConfig(normalizeConfig(stored));
+      const loaded = repairLoadedConfig(normalizeConfig(stored));
+      const storedDefaultsVersion = Number(stored && stored.blacklistDefaultsVersion) || 0;
+      if (storedDefaultsVersion < 2) {
+        const shouldSeedDefaults = storedDefaultsVersion < 1;
+        const legacyCompanyRules = normalizeCompanyBlacklistRules(stored && stored.companyBlacklistRules);
+        const legacyCompanyValue = splitTextFilterValues(stored && stored.companyBlacklistValue);
+        const existingNameRules = normalizeTextBlacklistRules(stored && stored.jobNameBlacklistRules, 'partial');
+        const existingNameValue = splitTextFilterValues(stored && stored.jobNameBlacklistValue);
+        const migratedNameRules = normalizeTextBlacklistRules(
+          legacyCompanyRules
+            .concat(legacyCompanyValue)
+            .concat(existingNameRules)
+            .concat(existingNameValue)
+            .concat(shouldSeedDefaults ? DEFAULT_CONFIG.jobNameBlacklistRules : []),
+          'partial',
+        );
+        const migratedJdRules = normalizeTextBlacklistRules(
+          normalizeTextBlacklistRules(stored && stored.jdBlacklistRules, 'partial')
+            .concat(splitTextFilterValues(stored && stored.jdBlacklistValue))
+            .concat(shouldSeedDefaults ? DEFAULT_CONFIG.jdBlacklistRules : []),
+          'partial',
+        );
+        loaded.jobNameBlacklistRules = migratedNameRules;
+        loaded.jobNameBlacklistValue = migratedNameRules.map((rule) => rule.value).join('，');
+        loaded.jobNameBlacklistMode = 'partial';
+        loaded.jdBlacklistRules = migratedJdRules;
+        loaded.jdBlacklistValue = migratedJdRules.map((rule) => rule.value).join('，');
+        loaded.jdBlacklistMode = 'partial';
+        loaded.blacklistDefaultsVersion = 2;
+        localStorage.setItem(APP.configKey, JSON.stringify(loaded));
+      }
+      return loaded;
     } catch (_) {
       return normalizeConfig(DEFAULT_CONFIG);
     }
@@ -232,13 +278,21 @@
     CONFIG_FIELD_KEYS.forEach((key) => {
       next[key] = raw[key] === undefined ? DEFAULT_CONFIG[key] : raw[key];
     });
-    next.jobNameFilterMode = getCompanyMatchMode(next.jobNameFilterMode);
-    next.jobNameFilterValue = normalizeText(next.jobNameFilterValue);
+    // 名称筛选固定为部分匹配，不让旧版保存的 exact/regex 影响新行为。
+    next.jobNameFilterMode = 'partial';
+    next.jobNameFilterValue = normalizeTextFilterInput(next.jobNameFilterValue);
     next.salaryMin = normalizeSalaryBound(next.salaryMin);
     next.salaryMax = normalizeSalaryBound(next.salaryMax);
+    next.unknownSalaryAction = next.unknownSalaryAction === 'skip' ? 'skip' : 'ignore';
     next.companyBlacklistMode = getCompanyMatchMode(next.companyBlacklistMode);
     next.companyBlacklistValue = normalizeText(next.companyBlacklistValue);
     next.companyBlacklistRules = normalizeCompanyBlacklistRules(next.companyBlacklistRules);
+    next.jobNameBlacklistMode = 'partial';
+    next.jobNameBlacklistValue = normalizeTextFilterInput(next.jobNameBlacklistValue);
+    next.jobNameBlacklistRules = normalizeTextBlacklistRules(next.jobNameBlacklistRules, 'partial');
+    next.jdBlacklistMode = 'partial';
+    next.jdBlacklistValue = normalizeTextFilterInput(next.jdBlacklistValue);
+    next.jdBlacklistRules = normalizeTextBlacklistRules(next.jdBlacklistRules, 'partial');
     next.bossActiveCustomOptions = normalizeBossActiveOptions(next.bossActiveCustomOptions)
       .filter((item) => !BOSS_ACTIVE_BUILTIN_KEYS.has(normalizeBossActiveText(item)));
 
@@ -293,31 +347,64 @@
     return '部分';
   }
 
-  // 公司黑名单规则支持数组对象，也兼容用户手动写入的换行/逗号文本。
-  function normalizeCompanyBlacklistRules(values) {
-    const list = Array.isArray(values)
-      ? values
-      : String(values || '').split(/[\n,，]+/).map((value) => ({ mode: 'partial', value }));
+  // 文本黑名单规则支持数组对象，也兼容用户手动写入的换行/逗号文本。
+  function splitTextFilterValues(value) {
+    return Array.from(new Set(
+      String(value == null ? '' : value)
+        .split(/[\n,，]+/)
+        .map(normalizeText)
+        .filter(Boolean),
+    ));
+  }
+
+  function normalizeTextFilterInput(value) {
+    return splitTextFilterValues(value).join('，');
+  }
+
+  // 文本黑名单兼容数组、对象和中文逗号/换行文本；forcedMode 用于名称类固定部分匹配。
+  function normalizeTextBlacklistRules(values, forcedMode) {
+    const sourceList = Array.isArray(values) ? values : [values];
+    const list = sourceList.flatMap((item) => {
+      const isObjectItem = item && typeof item === 'object';
+      const rawValue = isObjectItem ? item.value : item;
+      const parts = splitTextFilterValues(rawValue);
+      return parts.map((value, index) => ({
+        source: item,
+        value,
+        index,
+        count: parts.length,
+      }));
+    });
     const seen = new Set();
     const output = [];
 
     list.forEach((item) => {
-      const isObjectItem = item && typeof item === 'object';
-      const mode = getCompanyMatchMode(isObjectItem ? item.mode : 'partial');
-      const value = normalizeText(isObjectItem ? item.value : item);
+      const source = item.source;
+      const isObjectItem = source && typeof source === 'object';
+      const mode = getCompanyMatchMode(forcedMode || (isObjectItem ? source.mode : 'partial'));
+      const value = item.value;
       if (!value) return;
 
       const key = `${mode}:${value}`;
       if (seen.has(key)) return;
       seen.add(key);
+      const sourceId = normalizeText(isObjectItem && source.id);
+      const id = sourceId && item.count === 1
+        ? sourceId
+        : `black_${hashString(key)}`;
       output.push({
-        id: normalizeText(isObjectItem && item.id) || `black_${hashString(key)}`,
+        id,
         mode,
         value,
       });
     });
 
     return output;
+  }
+
+  // 公司黑名单保留旧函数名，避免历史配置和调用点失效。
+  function normalizeCompanyBlacklistRules(values) {
+    return normalizeTextBlacklistRules(values);
   }
 
   // 加载旧配置时清掉明显由浏览器自动填充/历史恢复写入的残留值。
@@ -2576,6 +2663,9 @@
               <strong>BOSS自动沟通</strong>
               <span class="za-subtitle">岗位问候自动化</span>
             </div>
+            <span class="za-daily-count" data-role="dailyDeliveryCount" aria-live="polite">
+              <span class="za-daily-count-label">今日已投递：</span><strong class="za-daily-count-value" data-role="dailyDeliveryCountValue">0</strong><span class="za-daily-count-limit">/${APP.dailyDeliveryLimit}</span>
+            </span>
             <div class="za-header-actions">
               <button class="za-feature-button" type="button" data-action="toggleFeaturePanel" aria-expanded="false" title="板块管理">
                 板块管理
@@ -2596,12 +2686,16 @@
 
           <section class="za-section" data-feature-section="greeting">
             <h3>打招呼配置</h3>
-            <div class="za-radio-row">
-              <label><input type="radio" name="za-greeting-mode" value="fastReply"> 常用语</label>
-              <label><input type="radio" name="za-greeting-mode" value="customText"> 自定义文本</label>
+            <div class="za-subsection">
+              <div class="za-subsection-title">问候方式</div>
+              <div class="za-radio-row">
+                <label><input type="radio" name="za-greeting-mode" value="fastReply"> 常用语</label>
+                <label><input type="radio" name="za-greeting-mode" value="customText"> 自定义文本</label>
+              </div>
             </div>
 
-            <div class="za-mode-block" data-mode-block="fastReply">
+            <div class="za-subsection za-mode-block" data-mode-block="fastReply">
+              <div class="za-subsection-title">常用语内容</div>
               <input data-field="fastReplyIndex" type="hidden">
               <div class="za-fast-reply-control">
                 <button class="za-fast-reply-trigger" type="button" data-action="toggleFastReplyPicker" aria-expanded="false" aria-haspopup="dialog">
@@ -2631,7 +2725,8 @@
               </div>
             </div>
 
-            <div class="za-mode-block" data-mode-block="customText">
+            <div class="za-subsection za-mode-block" data-mode-block="customText">
+              <div class="za-subsection-title">自定义内容</div>
               <div class="za-segment" aria-label="自定义文本来源">
                 <label><input type="radio" name="za-text-source" value="text"> 手动输入</label>
                 <label><input type="radio" name="za-text-source" value="api"> 接口返回</label>
@@ -2675,112 +2770,121 @@
 
           <section class="za-section" data-feature-section="strategy">
             <h3>运行策略</h3>
-            <label class="za-check"><input data-field="skipContacted" type="checkbox"> 跳过已沟通 HR</label>
-            <label class="za-check"><input data-field="collectGreetedJobs" type="checkbox"> 收集已打招呼岗位信息</label>
-            <label class="za-check"><input data-field="ignoreListRefresh" type="checkbox"> 无视列表刷新</label>
-            <label class="za-check"><input data-field="autoRefreshOnExhausted" type="checkbox"> 列表耗尽后自动刷新</label>
-            <div class="za-grid-2">
-              <label>最小间隔(秒)<input data-field="delayMin" type="number" min="1" step="1"></label>
-              <label>最大间隔(秒)<input data-field="delayMax" type="number" min="1" step="1"></label>
-              <label>等待上限(秒)<input data-field="waitTimeout" type="number" min="2" step="1"></label>
-              <label>聊天重试次数<input data-field="chatOpenRetries" type="number" min="0" step="1"></label>
-              <label>最大沟通数<input data-field="maxCount" type="number" min="0" step="1"></label>
-              <label>列表刷新上限<input data-field="maxListRefresh" type="number" min="0" step="1" title="当前列表耗尽后最多整页刷新次数，0 表示不限制"></label>
+            <div class="za-subsection">
+              <div class="za-subsection-title">处理规则</div>
+              <label class="za-check"><input data-field="skipContacted" type="checkbox"> 跳过已沟通 HR</label>
+              <label class="za-check"><input data-field="collectGreetedJobs" type="checkbox"> 收集已打招呼岗位信息</label>
+              <label class="za-check"><input data-field="ignoreListRefresh" type="checkbox"> 无视列表刷新</label>
+              <label class="za-check"><input data-field="autoRefreshOnExhausted" type="checkbox"> 列表耗尽后自动刷新</label>
+            </div>
+            <div class="za-subsection">
+              <div class="za-subsection-title">节奏与上限</div>
+              <div class="za-grid-2">
+                <label>最小间隔(秒)<input data-field="delayMin" type="number" min="1" step="1"></label>
+                <label>最大间隔(秒)<input data-field="delayMax" type="number" min="1" step="1"></label>
+                <label>等待上限(秒)<input data-field="waitTimeout" type="number" min="2" step="1"></label>
+                <label>聊天重试次数<input data-field="chatOpenRetries" type="number" min="0" step="1"></label>
+                <label>最大沟通数<input data-field="maxCount" type="number" min="0" step="1"></label>
+                <label>列表刷新上限<input data-field="maxListRefresh" type="number" min="0" step="1" title="当前列表耗尽后最多整页刷新次数，0 表示不限制"></label>
+              </div>
             </div>
           </section>
 
           <section class="za-section" data-feature-section="companyFilter">
             <h3>公司筛选</h3>
-            <label class="za-label">名称筛选</label>
-            <div class="za-inline">
-              <select data-field="jobNameFilterMode">
-                <option value="exact">全量匹配</option>
-                <option value="partial">部分匹配</option>
-                <option value="regex">正则匹配</option>
-              </select>
-              <input data-field="jobNameFilterValue" type="text" autocomplete="off" spellcheck="false" placeholder="留空则不过滤">
+            <div class="za-subsection">
+              <div class="za-subsection-title">名称筛选</div>
+              <textarea data-field="jobNameFilterValue" rows="2" autocomplete="off" spellcheck="false" placeholder="留空则不过滤"></textarea>
+              <p class="za-hint">固定部分匹配；多个关键词用中文逗号分隔，任意命中即可。</p>
             </div>
-            <div class="za-grid-2">
-              <label>工资下限不低于(K)<input data-field="salaryMin" data-empty-as-blank="true" type="number" min="0" step="0.1" placeholder="留空不启用"></label>
-              <label>工资上限不高于(K)<input data-field="salaryMax" data-empty-as-blank="true" type="number" min="0" step="0.1" placeholder="留空不启用"></label>
+            <div class="za-subsection">
+              <div class="za-subsection-title">工资筛选</div>
+              <div class="za-grid-2">
+                <label>工资下限不低于(K)<input data-field="salaryMin" data-empty-as-blank="true" type="number" min="0" step="0.1" placeholder="留空不启用"></label>
+                <label>工资上限不高于(K)<input data-field="salaryMax" data-empty-as-blank="true" type="number" min="0" step="0.1" placeholder="留空不启用"></label>
+              </div>
+              <label class="za-salary-unknown-action">无法识别工资时
+                <select data-field="unknownSalaryAction">
+                  <option value="ignore">忽略薪资，继续判断</option>
+                  <option value="skip">跳过该岗位</option>
+                </select>
+              </label>
+              <p class="za-hint">薪资按月薪 K 计算；工资上下限均留空时不启用薪资过滤。无法识别工资默认忽略薪资继续判断。</p>
             </div>
-            <p class="za-hint">薪资按月薪 K 计算；工资上下限均留空时不启用薪资过滤。</p>
+            <div class="za-subsection">
+              <div class="za-subsection-title">Boss活跃度筛选</div>
+              <div class="za-selected-area" data-role="bossActiveSelectedList"></div>
+              <div class="za-multi-dropdown" data-role="bossActiveDropdown">
+                <button class="za-multi-trigger" type="button" data-action="toggleBossActiveDropdown" aria-expanded="false">
+                  <span data-role="bossActiveDropdownText">选择 Boss 活跃度</span>
+                  <span class="za-multi-arrow">⌄</span>
+                </button>
+                <div class="za-multi-menu" data-role="bossActiveOptionMenu" hidden></div>
+              </div>
+              <div class="za-inline za-boss-active-add">
+                <input data-role="bossActiveCustomInput" data-lock-field="bossActiveCustomInput" type="text" autocomplete="off" spellcheck="false" placeholder="添加自定义活跃度">
+                <button type="button" data-action="addBossActiveOption">添加</button>
+              </div>
+              <div class="za-option-chips" data-role="bossActiveCustomList"></div>
+              <p class="za-hint">不选择代表不过滤；内置选项固定，自定义选项可删除。</p>
+            </div>
           </section>
 
           <section class="za-section" data-feature-section="companyBlacklist">
             <h3>公司黑名单</h3>
-            <div class="za-inline">
-              <select data-field="companyBlacklistMode">
-                <option value="exact">全量匹配</option>
-                <option value="partial">部分匹配</option>
-                <option value="regex">正则匹配</option>
-              </select>
-              <input data-field="companyBlacklistValue" type="text" autocomplete="off" spellcheck="false" placeholder="输入公司黑名单">
-              <button type="button" data-action="addCompanyBlacklistRule">添加</button>
+            <div class="za-subsection">
+              <div class="za-subsection-title">名称黑名单</div>
+              <textarea data-field="jobNameBlacklistValue" rows="2" autocomplete="off" spellcheck="false" placeholder="多个关键词用中文逗号分隔"></textarea>
+              <p class="za-hint">固定部分匹配；匹配公司名称；多个关键词用中文逗号分隔；默认：双休、工资、急、高薪。</p>
             </div>
-            <div class="za-multi-dropdown" data-role="companyBlacklistDropdown">
-              <button class="za-multi-trigger" type="button" data-action="toggleCompanyBlacklistDropdown" aria-expanded="false">
-                <span data-role="companyBlacklistDropdownText">查看已添加黑名单</span>
-                <span class="za-multi-arrow">⌄</span>
-              </button>
-              <div class="za-multi-menu" data-role="companyBlacklistOptionMenu" hidden></div>
-            </div>
-            <div class="za-inline za-blacklist-actions" data-role="companyBlacklistActions">
-              <button type="button" data-action="removeCompanyBlacklistRule">删除选中</button>
-              <button type="button" class="za-danger-soft" data-action="clearCompanyBlacklistRules">全部删除</button>
-            </div>
-            <p class="za-hint">任意黑名单命中都会在沟通前跳过该公司。</p>
-          </section>
 
-          <section class="za-section" data-feature-section="bossActive">
-            <h3>Boss活跃度筛选</h3>
-            <div class="za-selected-area" data-role="bossActiveSelectedList"></div>
-            <div class="za-multi-dropdown" data-role="bossActiveDropdown">
-              <button class="za-multi-trigger" type="button" data-action="toggleBossActiveDropdown" aria-expanded="false">
-                <span data-role="bossActiveDropdownText">选择 Boss 活跃度</span>
-                <span class="za-multi-arrow">⌄</span>
-              </button>
-              <div class="za-multi-menu" data-role="bossActiveOptionMenu" hidden></div>
+            <div class="za-subsection">
+              <div class="za-subsection-title">JD黑名单</div>
+              <textarea data-field="jdBlacklistValue" rows="2" autocomplete="off" spellcheck="false" placeholder="多个关键词用中文逗号分隔"></textarea>
+              <p class="za-hint">固定部分匹配；多个关键词用中文逗号分隔；默认：合伙、押金、保证金、培训费、代理加盟、刷单、垫资。</p>
             </div>
-            <div class="za-inline za-boss-active-add">
-              <input data-role="bossActiveCustomInput" data-lock-field="bossActiveCustomInput" type="text" autocomplete="off" spellcheck="false" placeholder="添加自定义活跃度">
-              <button type="button" data-action="addBossActiveOption">添加</button>
-            </div>
-            <div class="za-option-chips" data-role="bossActiveCustomList"></div>
-            <p class="za-hint">不选择代表不过滤；内置选项固定，自定义选项可删除。</p>
           </section>
 
           <section class="za-section" data-feature-section="export">
             <h3>数据导出</h3>
-            <div class="za-inline">
-              <select data-field="exportType">
-                <option value="json">JSON</option>
-                <option value="xlsx">Excel</option>
-              </select>
-              <button type="button" data-action="export">导出岗位记录</button>
+            <div class="za-subsection">
+              <div class="za-subsection-title">导出格式</div>
+              <div class="za-inline">
+                <select data-field="exportType">
+                  <option value="json">JSON</option>
+                  <option value="xlsx">Excel</option>
+                </select>
+                <button type="button" data-action="export">导出岗位记录</button>
+              </div>
             </div>
           </section>
 
           <section class="za-section" data-feature-section="cleanup">
             <h3>数据清理</h3>
-            <label class="za-cleanup-time">删除此时间前的记录
-              <input data-field="clearBeforeTime" type="datetime-local">
-            </label>
-            <div class="za-inline">
-              <button type="button" data-action="clearRecordsByTime">按时间删除</button>
-              <button type="button" class="za-danger-soft" data-action="clearAllRecords">删除所有记录</button>
+            <div class="za-subsection">
+              <div class="za-subsection-title">按范围删除</div>
+              <label class="za-cleanup-time">删除此时间前的记录
+                <input data-field="clearBeforeTime" type="datetime-local">
+              </label>
+              <div class="za-inline">
+                <button type="button" data-action="clearRecordsByTime">按时间删除</button>
+                <button type="button" class="za-danger-soft" data-action="clearAllRecords">删除所有记录</button>
+              </div>
+              <p class="za-hint">按时间删除会使用发送时间，未发送记录使用点击或更新时间。</p>
             </div>
-            <p class="za-hint">按时间删除会使用发送时间，未发送记录使用点击或更新时间。</p>
           </section>
 
           <section class="za-section" data-feature-section="debugLog">
             <h3>调试日志</h3>
-            <label class="za-check"><input data-role="debugLogEnabled" type="checkbox"> 记录诊断日志</label>
-            <div class="za-inline">
-              <button type="button" data-action="exportDebugLogs">导出日志</button>
-              <button type="button" class="za-danger-soft" data-action="clearDebugLogs">清除日志</button>
+            <div class="za-subsection">
+              <div class="za-subsection-title">诊断工具</div>
+              <label class="za-check"><input data-role="debugLogEnabled" type="checkbox"> 记录诊断日志</label>
+              <div class="za-inline">
+                <button type="button" data-action="exportDebugLogs">导出日志</button>
+                <button type="button" class="za-danger-soft" data-action="clearDebugLogs">清除日志</button>
+              </div>
+              <p class="za-hint" data-role="debugLogStatus">日志 0 条</p>
             </div>
-            <p class="za-hint" data-role="debugLogStatus">日志 0 条</p>
           </section>
 
           <section class="za-section za-list-section" data-feature-section="greetedList">
@@ -2788,6 +2892,25 @@
             <div class="za-list-viewport" data-role="listViewport">
               <div class="za-list-spacer" data-role="listSpacer"></div>
               <div class="za-list-items" data-role="listItems"></div>
+            </div>
+          </section>
+
+          <section class="za-section za-about-section" data-feature-section="about">
+            <h3>关于</h3>
+            <div class="za-about-card">
+              <div class="za-about-row">
+                <span>当前版本</span>
+                <strong data-role="aboutCurrentVersion">v${escapeHtml(APP.version)}</strong>
+              </div>
+              <div class="za-about-row">
+                <span>最新版本</span>
+                <strong data-role="aboutLatestVersion">检查中...</strong>
+              </div>
+              <div class="za-about-actions">
+                <span class="za-about-status" data-role="aboutVersionStatus">正在从 GitHub 获取版本信息</span>
+                <button type="button" data-action="refreshLatestVersion">重新检查</button>
+              </div>
+              <a class="za-about-link" href="https://github.com/agarcabin/boss-auto-greeting" target="_blank" rel="noopener noreferrer">打开 GitHub 仓库</a>
             </div>
           </section>
 
@@ -2803,6 +2926,8 @@
         root,
         panel: root.querySelector('.za-panel'),
         toggle: root.querySelector('.za-toggle'),
+        dailyDeliveryCount: root.querySelector('[data-role="dailyDeliveryCount"]'),
+        dailyDeliveryCountValue: root.querySelector('[data-role="dailyDeliveryCountValue"]'),
         status: root.querySelector('[data-role="status"]'),
         featurePanel: root.querySelector('[data-role="featurePanel"]'),
         featureButton: root.querySelector('[data-action="toggleFeaturePanel"]'),
@@ -2822,17 +2947,15 @@
         bossActiveOptionMenu: root.querySelector('[data-role="bossActiveOptionMenu"]'),
         bossActiveCustomInput: root.querySelector('[data-role="bossActiveCustomInput"]'),
         bossActiveCustomList: root.querySelector('[data-role="bossActiveCustomList"]'),
-        companyBlacklistDropdown: root.querySelector('[data-role="companyBlacklistDropdown"]'),
-        companyBlacklistDropdownText: root.querySelector('[data-role="companyBlacklistDropdownText"]'),
-        companyBlacklistOptionMenu: root.querySelector('[data-role="companyBlacklistOptionMenu"]'),
-        companyBlacklistRemoveButton: root.querySelector('[data-action="removeCompanyBlacklistRule"]'),
-        companyBlacklistClearButton: root.querySelector('[data-action="clearCompanyBlacklistRules"]'),
-        companyBlacklistSelectedIds: new Set(),
         debugLogEnabled: root.querySelector('[data-role="debugLogEnabled"]'),
         debugLogStatus: root.querySelector('[data-role="debugLogStatus"]'),
         listViewport: root.querySelector('[data-role="listViewport"]'),
         listSpacer: root.querySelector('[data-role="listSpacer"]'),
         listItems: root.querySelector('[data-role="listItems"]'),
+        aboutCurrentVersion: root.querySelector('[data-role="aboutCurrentVersion"]'),
+        aboutLatestVersion: root.querySelector('[data-role="aboutLatestVersion"]'),
+        aboutVersionStatus: root.querySelector('[data-role="aboutVersionStatus"]'),
+        aboutRefreshButton: root.querySelector('[data-action="refreshLatestVersion"]'),
         greetedRows: [],
         rowHeight: 66,
       };
@@ -2843,12 +2966,14 @@
       this.applyConfigToForm();
       this.renderDebugLogControls();
       this.renderFastReplyOptions();
-      this.renderCompanyBlacklistRules();
       this.renderBossActiveFilterOptions();
+      this.renderAbout();
+      this.refreshLatestVersion();
       this.setFeaturePanelOpen(config.featurePanelOpen);
       this.setPanelOpen(config.panelOpen);
       this.scheduleConfigReapply();
       this.refreshGreetedList();
+      this.scheduleDailyDeliveryCountRefresh();
 
       if (!config.fastReplies || !config.fastReplies.length) {
         setTimeout(() => FastReplyService.refresh(false), 500);
@@ -2907,7 +3032,6 @@
         if (action === 'toggleFeaturePanel') {
           this.setFastReplyPickerOpen(false);
           this.setBossActiveDropdownOpen(false);
-          this.setCompanyBlacklistDropdownOpen(false);
           this.setFeaturePanelOpen(!this.isFeaturePanelOpen());
           return;
         }
@@ -2922,7 +3046,6 @@
         if (action === 'toggleFastReplyPicker') {
           this.setFeaturePanelOpen(false);
           this.setBossActiveDropdownOpen(false);
-          this.setCompanyBlacklistDropdownOpen(false);
           this.setFastReplyPickerOpen(!this.isFastReplyPickerOpen());
           return;
         }
@@ -2941,15 +3064,7 @@
         if (action === 'toggleBossActiveDropdown') {
           this.setFeaturePanelOpen(false);
           this.setFastReplyPickerOpen(false);
-          this.setCompanyBlacklistDropdownOpen(false);
           this.setBossActiveDropdownOpen(!this.isBossActiveDropdownOpen());
-          return;
-        }
-        if (action === 'toggleCompanyBlacklistDropdown') {
-          this.setFeaturePanelOpen(false);
-          this.setFastReplyPickerOpen(false);
-          this.setBossActiveDropdownOpen(false);
-          this.setCompanyBlacklistDropdownOpen(!this.isCompanyBlacklistDropdownOpen());
           return;
         }
         if (action !== 'stop') this.unlockStatus();
@@ -2962,21 +3077,12 @@
         if (action === 'clearRecordsByTime') RecordCleaner.clearByTime();
         if (action === 'clearAllRecords') RecordCleaner.clearAll();
         if (action === 'clearDebugLogs') DebugLogService.clearLogs();
-        if (action === 'addCompanyBlacklistRule') this.addCompanyBlacklistRule();
-        if (action === 'removeCompanyBlacklistRule') this.removeCompanyBlacklistRule(target.dataset.id);
-        if (action === 'clearCompanyBlacklistRules') this.clearCompanyBlacklistRules();
+        if (action === 'refreshLatestVersion') this.refreshLatestVersion({ manual: true });
         if (action === 'addBossActiveOption') this.addBossActiveCustomOption();
         if (action === 'deleteBossActiveOption') this.deleteBossActiveCustomOption(target.dataset.value);
         if (action === 'removeBossActiveSelection') this.removeBossActiveSelection(target.dataset.value);
         if (action !== 'toggleBossActiveDropdown' && !target.closest('[data-role="bossActiveDropdown"]')) {
           this.setBossActiveDropdownOpen(false);
-        }
-        if (
-          action !== 'toggleCompanyBlacklistDropdown' &&
-          !target.closest('[data-role="companyBlacklistDropdown"]') &&
-          !target.closest('[data-role="companyBlacklistActions"]')
-        ) {
-          this.setCompanyBlacklistDropdownOpen(false);
         }
       });
 
@@ -2985,9 +3091,18 @@
           this.renderFastReplyPickerList();
           return;
         }
+        this.resizeTextFilterFields();
         if (this.shouldIgnoreConfigFieldEvent(event)) return;
         this.noteJobNameFilterEdit(event);
+        if (this.isDeferredTextFilterField(this.getConfigFieldFromTarget(event.target))) return;
         this.saveFormToConfig({ event });
+      });
+      root.addEventListener('focusout', (event) => {
+        if (this.shouldIgnoreConfigFieldEvent(event)) return;
+        const field = this.getConfigFieldFromTarget(event.target);
+        if (!this.isDeferredTextFilterField(field)) return;
+        this.noteJobNameFilterEdit(event);
+        this.saveDeferredTextFilterField(field);
       });
       root.addEventListener('change', (event) => {
         if (event.target && event.target.dataset && event.target.dataset.role === 'debugLogEnabled') {
@@ -2996,8 +3111,9 @@
         }
         if (this.shouldIgnoreConfigFieldEvent(event)) return;
         this.noteJobNameFilterEdit(event);
-        if (event.target && event.target.dataset && event.target.dataset.role === 'companyBlacklistRuleOption') {
-          this.setCompanyBlacklistRuleSelected(event.target.value, event.target.checked, true);
+        const configField = this.getConfigFieldFromTarget(event.target);
+        if (this.isDeferredTextFilterField(configField)) {
+          this.saveDeferredTextFilterField(configField);
           return;
         }
         if (event.target && event.target.dataset && event.target.dataset.role === 'bossActiveOption') {
@@ -3021,12 +3137,6 @@
           this.setFastReplyPickerOpen(false);
           return;
         }
-        if (event.key === 'Escape' && this.isCompanyBlacklistDropdownOpen()) {
-          event.preventDefault();
-          event.stopPropagation();
-          this.setCompanyBlacklistDropdownOpen(false);
-          return;
-        }
         if (event.key === 'Escape' && this.isBossActiveDropdownOpen()) {
           event.preventDefault();
           event.stopPropagation();
@@ -3044,9 +3154,12 @@
         }
 
         if (event.key !== 'Enter') return;
-        if (event.target && event.target.dataset && event.target.dataset.field === 'companyBlacklistValue') {
-          event.preventDefault();
-          this.addCompanyBlacklistRule();
+        const fieldKey = event.target && event.target.dataset && event.target.dataset.field;
+        if (
+          event.target &&
+          event.target.tagName === 'TEXTAREA' &&
+          ['jobNameFilterValue', 'jobNameBlacklistValue', 'jdBlacklistValue'].includes(fieldKey)
+        ) {
           return;
         }
         if (!event.target || !event.target.dataset || event.target.dataset.role !== 'bossActiveCustomInput') return;
@@ -3066,10 +3179,6 @@
           this.setFastReplyPickerOpen(false);
           return;
         }
-        if (this.isCompanyBlacklistDropdownOpen()) {
-          this.setCompanyBlacklistDropdownOpen(false);
-          return;
-        }
         if (this.isBossActiveDropdownOpen()) {
           this.setBossActiveDropdownOpen(false);
           return;
@@ -3081,7 +3190,6 @@
         if (!runtime.ui || !runtime.ui.root || this.isEventFromUiRoot(event)) return;
         this.setFeaturePanelOpen(false);
         this.setFastReplyPickerOpen(false);
-        this.setCompanyBlacklistDropdownOpen(false);
         this.setBossActiveDropdownOpen(false);
       });
     },
@@ -3156,6 +3264,51 @@
       }
     },
 
+    // 多关键词文本框在失焦时统一规范化并保存；输入过程中只调整高度，避免每次按键都写入配置。
+    isDeferredTextFilterField(field) {
+      const key = field && field.dataset && field.dataset.field;
+      return ['jobNameFilterValue', 'jobNameBlacklistValue', 'jdBlacklistValue'].includes(key);
+    },
+
+    saveDeferredTextFilterField(field) {
+      if (!this.isDeferredTextFilterField(field)) return;
+
+      const key = field.dataset.field;
+      const normalized = normalizeTextFilterInput(field.value);
+      field.value = normalized;
+
+      if (key === 'jobNameFilterValue') {
+        saveConfig({ jobNameFilterValue: normalized });
+      } else if (key === 'jobNameBlacklistValue') {
+        saveConfig({
+          jobNameBlacklistMode: 'partial',
+          jobNameBlacklistValue: normalized,
+          jobNameBlacklistRules: normalizeTextBlacklistRules(normalized, 'partial'),
+        });
+      } else if (key === 'jdBlacklistValue') {
+        saveConfig({
+          jdBlacklistMode: 'partial',
+          jdBlacklistValue: normalized,
+          jdBlacklistRules: normalizeTextBlacklistRules(normalized, 'partial'),
+        });
+      }
+
+      this.resizeTextFilterFields();
+    },
+
+    // 启动、导出或清理等操作可能在输入框尚未自然失焦时触发，主动提交用户已经触碰过的文本框。
+    saveDeferredTextFilterFields() {
+      if (!runtime.ui || !runtime.ui.root) return;
+      runtime.ui.root.querySelectorAll(
+        '[data-field="jobNameFilterValue"], [data-field="jobNameBlacklistValue"], [data-field="jdBlacklistValue"]',
+      ).forEach((field) => {
+        if (field.dataset.userTouched === 'true' || document.activeElement === field) {
+          if (field.dataset.field === 'jobNameFilterValue' && !this.shouldSaveJobNameFilterValue(field, null)) return;
+          this.saveDeferredTextFilterField(field);
+        }
+      });
+    },
+
     // 自动填充事件被忽略时，把字段恢复到当前配置值。
     restoreConfigFieldValue(field) {
       const key = field && field.dataset && field.dataset.field;
@@ -3227,8 +3380,9 @@
         section.hidden = !blocks[id];
       });
 
-      if (!blocks.companyBlacklist) this.setCompanyBlacklistDropdownOpen(false);
-      if (!blocks.bossActive) this.setBossActiveDropdownOpen(false);
+      if (!blocks.companyFilter) {
+        this.setBossActiveDropdownOpen(false);
+      }
     },
 
     // 展开/收起面板并持久化到配置。
@@ -3259,12 +3413,94 @@
         this.setConfigFieldValue(field, config[key]);
       }
 
+      this.resizeTextFilterFields();
       this.applyModeVisibility();
       this.renderFeatureBlockControls();
       this.applyFeatureBlockVisibility();
       this.renderDebugLogControls();
-      this.renderCompanyBlacklistRules();
       this.renderBossActiveFilterOptions();
+    },
+
+    // 多关键词输入框按内容自动增高，并在达到上限后保留滚动条。
+    resizeTextFilterFields() {
+      if (!runtime.ui || !runtime.ui.root) return;
+      const fields = runtime.ui.root.querySelectorAll(
+        '[data-field="jobNameFilterValue"], [data-field="jobNameBlacklistValue"], [data-field="jdBlacklistValue"]',
+      );
+      const minHeight = 76;
+      const maxHeight = 240;
+      fields.forEach((field) => {
+        field.style.height = 'auto';
+        const height = Math.min(Math.max(field.scrollHeight, minHeight), maxHeight);
+        field.style.height = `${height}px`;
+      });
+    },
+
+    renderAbout() {
+      if (!runtime.ui) return;
+      if (runtime.ui.aboutCurrentVersion) {
+        runtime.ui.aboutCurrentVersion.textContent = formatVersionLabel(APP.version);
+      }
+      if (runtime.ui.aboutLatestVersion) {
+        runtime.ui.aboutLatestVersion.textContent = runtime.latestVersion
+          ? formatVersionLabel(runtime.latestVersion)
+          : runtime.latestVersionRequest
+            ? '检查中...'
+            : '尚未检查';
+      }
+      if (runtime.ui.aboutRefreshButton) {
+        runtime.ui.aboutRefreshButton.disabled = Boolean(runtime.latestVersionRequest);
+      }
+    },
+
+    async refreshLatestVersion() {
+      if (!runtime.ui) return null;
+      if (runtime.latestVersionRequest) return runtime.latestVersionRequest;
+
+      const status = runtime.ui.aboutVersionStatus;
+      const latest = runtime.ui.aboutLatestVersion;
+      const refreshButton = runtime.ui.aboutRefreshButton;
+      if (latest) latest.textContent = '检查中...';
+      if (status) {
+        status.textContent = '正在从 GitHub 获取版本信息';
+        status.dataset.type = 'info';
+      }
+      if (refreshButton) refreshButton.disabled = true;
+
+      const request = (async () => {
+        try {
+          const url = `${APP.githubVersionUrl}?_=${Date.now()}`;
+          const source = await fetchText(url).catch(() => gmGetText(url));
+          const version = parseUserScriptVersion(source);
+          if (!version) throw new Error('GitHub 文件中未找到版本号');
+
+          runtime.latestVersion = version;
+          if (latest) latest.textContent = formatVersionLabel(version);
+          if (status) {
+            const comparison = compareVersionText(APP.version, version);
+            status.textContent = comparison === 0
+              ? '当前已是 GitHub 最新版本'
+              : comparison < 0
+                ? 'GitHub 有更新版本可用'
+                : '当前版本高于 GitHub 主分支版本';
+            status.dataset.type = comparison < 0 ? 'warn' : 'ok';
+          }
+          return version;
+        } catch (error) {
+          if (latest) latest.textContent = '获取失败';
+          if (status) {
+            status.textContent = `GitHub 版本获取失败：${error.message || error}`;
+            status.dataset.type = 'error';
+          }
+          return null;
+        } finally {
+          runtime.latestVersionRequest = null;
+          if (refreshButton) refreshButton.disabled = false;
+        }
+      })();
+
+      runtime.latestVersionRequest = request;
+      return request;
     },
 
     // 调试日志不属于运行配置，单独同步本地开关和日志条数。
@@ -3281,6 +3517,7 @@
 
     // 从表单读取配置并保存；运行中会跳过被锁定的字段。
     saveFormToConfig(options) {
+      this.saveDeferredTextFilterFields();
       const root = runtime.ui.root;
       const next = {};
       const eventTarget = options && options.event && options.event.target;
@@ -3481,195 +3718,6 @@
       this.setFastReplyPickerOpen(false);
     },
 
-    // 渲染公司黑名单下拉多选，每条规则展示匹配模式，便于区分全量/部分/正则。
-    renderCompanyBlacklistRules() {
-      if (!runtime.ui || !runtime.ui.companyBlacklistOptionMenu) return;
-
-      const rules = normalizeCompanyBlacklistRules(config.companyBlacklistRules);
-      const selectedIds = this.getCompanyBlacklistSelectedIds(rules);
-      const running = runtime.ui.root.classList.contains('za-running');
-      runtime.ui.companyBlacklistOptionMenu.innerHTML = rules.length
-        ? rules.map((rule) => {
-            const checked = selectedIds.has(rule.id) ? ' checked' : '';
-            const disabled = running ? ' disabled' : '';
-            return `
-              <div class="za-multi-option za-blacklist-option">
-                <label class="za-blacklist-option-label">
-                  <input data-role="companyBlacklistRuleOption" type="checkbox" value="${escapeHtml(rule.id)}"${checked}${disabled}>
-                  <span title="${escapeHtml(rule.value)}">[${escapeHtml(getCompanyMatchModeLabel(rule.mode))}] ${escapeHtml(rule.value)}</span>
-                </label>
-                <button class="za-blacklist-delete" type="button" data-action="removeCompanyBlacklistRule" data-id="${escapeHtml(rule.id)}" title="删除该黑名单"${disabled}>×</button>
-              </div>
-            `;
-          }).join('')
-        : '<div class="za-empty-text">暂无公司黑名单</div>';
-
-      if (runtime.ui.companyBlacklistDropdownText) {
-        runtime.ui.companyBlacklistDropdownText.textContent = rules.length
-          ? selectedIds.size
-            ? `已选 ${selectedIds.size}/${rules.length} 条`
-            : `已添加 ${rules.length} 条`
-          : '暂无公司黑名单';
-      }
-
-      const trigger = runtime.ui.companyBlacklistDropdown &&
-        runtime.ui.companyBlacklistDropdown.querySelector('[data-action="toggleCompanyBlacklistDropdown"]');
-      if (trigger) {
-        trigger.disabled = running || !rules.length;
-        trigger.setAttribute('aria-expanded', this.isCompanyBlacklistDropdownOpen() ? 'true' : 'false');
-      }
-      runtime.ui.companyBlacklistOptionMenu.querySelectorAll('input[data-role="companyBlacklistRuleOption"]').forEach((input) => {
-        input.disabled = running;
-      });
-      if (runtime.ui.companyBlacklistRemoveButton) {
-        runtime.ui.companyBlacklistRemoveButton.disabled = running || !selectedIds.size;
-      }
-      if (runtime.ui.companyBlacklistClearButton) {
-        runtime.ui.companyBlacklistClearButton.disabled = running || !rules.length;
-      }
-      if (!rules.length) this.setCompanyBlacklistDropdownOpen(false);
-    },
-
-    // 获取当前用于删除的黑名单勾选项，并清掉已不存在的规则 ID。
-    getCompanyBlacklistSelectedIds(rules) {
-      const availableIds = new Set((rules || normalizeCompanyBlacklistRules(config.companyBlacklistRules)).map((rule) => rule.id));
-      const selectedIds = runtime.ui.companyBlacklistSelectedIds instanceof Set
-        ? runtime.ui.companyBlacklistSelectedIds
-        : new Set();
-      Array.from(selectedIds).forEach((id) => {
-        if (!availableIds.has(id)) selectedIds.delete(id);
-      });
-      runtime.ui.companyBlacklistSelectedIds = selectedIds;
-      return selectedIds;
-    },
-
-    // 判断公司黑名单下拉是否打开。
-    isCompanyBlacklistDropdownOpen() {
-      return Boolean(runtime.ui && runtime.ui.companyBlacklistOptionMenu && !runtime.ui.companyBlacklistOptionMenu.hidden);
-    },
-
-    // 打开/关闭公司黑名单下拉，并同步 aria 状态。
-    setCompanyBlacklistDropdownOpen(open) {
-      if (!runtime.ui || !runtime.ui.companyBlacklistOptionMenu || !runtime.ui.companyBlacklistDropdown) return;
-      const trigger = runtime.ui.companyBlacklistDropdown.querySelector('[data-action="toggleCompanyBlacklistDropdown"]');
-      const rules = normalizeCompanyBlacklistRules(config.companyBlacklistRules);
-      const shouldOpen = Boolean(open && rules.length && !(trigger && trigger.disabled));
-      runtime.ui.companyBlacklistOptionMenu.hidden = !shouldOpen;
-      runtime.ui.companyBlacklistDropdown.classList.toggle('za-open', shouldOpen);
-      if (trigger) trigger.setAttribute('aria-expanded', shouldOpen ? 'true' : 'false');
-    },
-
-    // 勾选或取消某个黑名单规则，仅影响“删除选中”的临时选择状态。
-    setCompanyBlacklistRuleSelected(id, selected, keepDropdownOpen) {
-      const key = normalizeText(id);
-      if (!key || !runtime.ui) return;
-
-      const selectedIds = this.getCompanyBlacklistSelectedIds();
-      if (selected) {
-        selectedIds.add(key);
-      } else {
-        selectedIds.delete(key);
-      }
-      this.renderCompanyBlacklistRules();
-      this.setCompanyBlacklistDropdownOpen(Boolean(keepDropdownOpen));
-    },
-
-    // 添加公司黑名单规则，保存前校验正则并按“模式+文本”去重。
-    addCompanyBlacklistRule() {
-      const root = runtime.ui && runtime.ui.root;
-      if (!root) return;
-
-      const modeField = root.querySelector('[data-field="companyBlacklistMode"]');
-      const valueField = root.querySelector('[data-field="companyBlacklistValue"]');
-      const mode = getCompanyMatchMode(modeField && modeField.value);
-      const value = normalizeText(valueField && valueField.value);
-      if (!value) {
-        UI.setStatus('请输入公司黑名单文本', 'warn');
-        return;
-      }
-      if (mode === 'regex') {
-        try {
-          new RegExp(value);
-        } catch (error) {
-          UI.setStatus(`公司黑名单正则无效：${error.message}`, 'error');
-          return;
-        }
-      }
-
-      const rules = normalizeCompanyBlacklistRules(config.companyBlacklistRules);
-      const exists = rules.some((rule) => rule.mode === mode && rule.value === value);
-      if (exists) {
-        UI.setStatus('该公司黑名单已存在', 'warn');
-        if (valueField) valueField.value = '';
-        saveConfig({ companyBlacklistMode: mode, companyBlacklistValue: '' });
-        return;
-      }
-
-      const key = `${mode}:${value}`;
-      const nextRule = {
-        id: `black_${hashString(`${key}:${Date.now()}`)}`,
-        mode,
-        value,
-      };
-      saveConfig({
-        companyBlacklistMode: mode,
-        companyBlacklistValue: '',
-        companyBlacklistRules: rules.concat(nextRule),
-      });
-      if (valueField) valueField.value = '';
-      this.renderCompanyBlacklistRules();
-      UI.setStatus(`已添加公司黑名单：${getCompanyMatchModeLabel(mode)} / ${value}`, 'ok');
-    },
-
-    // 删除当前勾选的公司黑名单规则，支持一次删除多条。
-    removeCompanyBlacklistRule(id) {
-      const rules = normalizeCompanyBlacklistRules(config.companyBlacklistRules);
-      const selectedIds = id
-        ? new Set([normalizeText(id)].filter(Boolean))
-        : new Set(this.getCompanyBlacklistSelectedIds(rules));
-      if (!selectedIds.size) {
-        UI.setStatus('请选择要移除的公司黑名单', 'warn');
-        return;
-      }
-
-      const nextRules = rules.filter((rule) => !selectedIds.has(rule.id));
-      if (nextRules.length === rules.length) return;
-
-      if (id) {
-        this.getCompanyBlacklistSelectedIds(rules).delete(normalizeText(id));
-      } else {
-        runtime.ui.companyBlacklistSelectedIds = new Set();
-      }
-      saveConfig({ companyBlacklistRules: nextRules });
-      this.renderCompanyBlacklistRules();
-      this.setCompanyBlacklistDropdownOpen(Boolean(nextRules.length));
-      UI.setStatus(`已删除 ${rules.length - nextRules.length} 条公司黑名单`, 'ok');
-    },
-
-    // 删除全部公司黑名单规则。
-    async clearCompanyBlacklistRules() {
-      const rules = normalizeCompanyBlacklistRules(config.companyBlacklistRules);
-      if (!rules.length) {
-        UI.setStatus('暂无公司黑名单可删除', 'warn');
-        return;
-      }
-
-      let confirmed = false;
-      try {
-        confirmed = await askConfirm(`确定删除全部 ${rules.length} 条公司黑名单吗？`);
-      } catch (error) {
-        UI.setStatus(error.message || '无法打开确认弹窗', 'error');
-        return;
-      }
-      if (!confirmed) return;
-
-      runtime.ui.companyBlacklistSelectedIds = new Set();
-      saveConfig({ companyBlacklistRules: [] });
-      this.renderCompanyBlacklistRules();
-      this.setCompanyBlacklistDropdownOpen(false);
-      UI.setStatus('已删除全部公司黑名单', 'ok');
-    },
-
     // 渲染 Boss 活跃度下拉多选、已选标签和自定义选项标签。
     renderBossActiveFilterOptions() {
       if (!runtime.ui || !runtime.ui.bossActiveOptionMenu) return;
@@ -3802,6 +3850,12 @@
       runtime.ui.status.dataset.type = type || 'info';
     },
 
+    // 显示筛选跳过原因，并让后续等待提示保留这条原因，避免用户只看到笼统的等待状态。
+    setSkipStatus(message) {
+      runtime.lastSkipReason = message || '';
+      this.setStatus(runtime.lastSkipReason, 'warn');
+    },
+
     // 锁定状态提示，通常用于 fatal/pause，避免后续异步任务覆盖真正停机原因。
     lockStatus(message, type) {
       runtime.statusLock = {
@@ -3815,6 +3869,7 @@
     // 手动操作或重新启动前解除状态锁。
     unlockStatus() {
       runtime.statusLock = null;
+      runtime.lastSkipReason = '';
     },
 
     // 切换运行态：禁用启动按钮、启用停止按钮，并锁定会影响流程的配置项。
@@ -3833,7 +3888,6 @@
       const root = runtime.ui.root;
       if (locked) {
         this.setFastReplyPickerOpen(false);
-        this.setCompanyBlacklistDropdownOpen(false);
         this.setBossActiveDropdownOpen(false);
       }
 
@@ -3846,7 +3900,7 @@
         field.disabled = locked;
       });
 
-      root.querySelectorAll('[data-lock-field], [data-role="companyBlacklistRuleOption"], [data-role="bossActiveOption"], [data-action="toggleCompanyBlacklistDropdown"], [data-action="toggleBossActiveDropdown"], [data-action="removeBossActiveSelection"]').forEach((field) => {
+      root.querySelectorAll('[data-lock-field], [data-role="bossActiveOption"], [data-action="toggleBossActiveDropdown"], [data-action="removeBossActiveSelection"]').forEach((field) => {
         field.disabled = locked;
       });
 
@@ -3861,10 +3915,40 @@
         field.disabled = locked;
       });
 
-      root.querySelectorAll('[data-action="addCompanyBlacklistRule"], [data-action="removeCompanyBlacklistRule"], [data-action="clearCompanyBlacklistRules"], [data-action="addBossActiveOption"], [data-action="deleteBossActiveOption"]').forEach((button) => {
+      root.querySelectorAll('[data-action="addBossActiveOption"], [data-action="deleteBossActiveOption"]').forEach((button) => {
         button.disabled = locked;
       });
-      this.renderCompanyBlacklistRules();
+    },
+
+    // 按当天成功发送的沟通记录刷新标题栏计数。
+    refreshDailyDeliveryCount(rows) {
+      if (!runtime.ui || !runtime.ui.dailyDeliveryCount) return;
+
+      const count = countTodayDeliveredRows(Array.isArray(rows) ? rows : runtime.ui.greetedRows);
+      const limit = APP.dailyDeliveryLimit;
+      if (runtime.ui.dailyDeliveryCountValue) {
+        runtime.ui.dailyDeliveryCountValue.textContent = count;
+      } else {
+        runtime.ui.dailyDeliveryCount.textContent = `今日已投递：${count}/${limit}`;
+      }
+      runtime.ui.dailyDeliveryCount.title = `今日已成功发送 ${count} 条沟通消息，上限 ${limit} 条`;
+      runtime.ui.dailyDeliveryCount.setAttribute('aria-label', `今日已投递 ${count} 条，共 ${limit} 条上限`);
+    },
+
+    // 每天本地零点重新读取一次列表，让日期变化后计数自动归零。
+    scheduleDailyDeliveryCountRefresh() {
+      if (!runtime.ui) return;
+      if (runtime.ui.dailyDeliveryCountTimer) {
+        clearTimeout(runtime.ui.dailyDeliveryCountTimer);
+      }
+
+      const nextMidnight = new Date();
+      nextMidnight.setHours(24, 0, 1, 0);
+      const delay = Math.max(1000, nextMidnight.getTime() - Date.now());
+      runtime.ui.dailyDeliveryCountTimer = setTimeout(() => {
+        if (!runtime.ui) return;
+        this.refreshGreetedList().finally(() => this.scheduleDailyDeliveryCountRefresh());
+      }, delay);
     },
 
     // 从 IndexedDB 读取已沟通记录并刷新虚拟列表。
@@ -3872,6 +3956,7 @@
       try {
         const rows = await loadGreetedRows();
         runtime.ui.greetedRows = rows;
+        this.refreshDailyDeliveryCount(rows);
         if (options && options.scrollTop && runtime.ui.listViewport) {
           runtime.ui.listViewport.scrollTop = 0;
         }
@@ -3894,6 +3979,7 @@
       }
 
       runtime.ui.greetedRows = sortGreetedRows(rows);
+      this.refreshDailyDeliveryCount(runtime.ui.greetedRows);
       if (runtime.ui.listViewport) runtime.ui.listViewport.scrollTop = 0;
       this.renderVirtualList();
     },
@@ -3922,6 +4008,22 @@
       }).join('');
     },
   };
+
+  // 统计本地日期内成功发送的岗位；已点击、已跳过和未确认发送的记录不计入投递数。
+  function countTodayDeliveredRows(rows) {
+    const today = getLocalDateKey(new Date());
+    return Array.from(rows || []).filter((record) => {
+      if (!record || (record.status !== 'sent' && !record.sentAt)) return false;
+      const communicationTime = record.sentAt || record.updatedAt;
+      const timestamp = Date.parse(communicationTime || '');
+      return Number.isFinite(timestamp) && getLocalDateKey(new Date(timestamp)) === today;
+    }).length;
+  }
+
+  function getLocalDateKey(date) {
+    const pad = (value) => String(value).padStart(2, '0');
+    return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+  }
 
   // 读取已沟通列表：优先使用 jobRecords 中的 sent/skipped 记录，再兼容 greetedJobs 旧投影。
   async function loadGreetedRows() {
@@ -4271,7 +4373,17 @@
           }
 
           const waitMs = randomDelayMs(config.delayMin, config.delayMax);
-          await waitWithStatusCountdown(Date.now() + waitMs, (remainingSeconds) => `等待 ${remainingSeconds} 秒后继续...`);
+          const skipReason = runtime.lastSkipReason;
+          try {
+            await waitWithStatusCountdown(
+              Date.now() + waitMs,
+              (remainingSeconds) => skipReason
+                ? `${skipReason}；等待 ${remainingSeconds} 秒后继续...`
+                : `等待 ${remainingSeconds} 秒后继续...`,
+            );
+          } finally {
+            if (runtime.lastSkipReason === skipReason) runtime.lastSkipReason = '';
+          }
         }
       } catch (error) {
         this.fatal(error.message || String(error));
@@ -4334,20 +4446,41 @@
           listState: getDebugListState(),
         });
 
-        // 名称/薪资筛选、公司黑名单和已沟通跳过都在点击沟通前完成，减少无意义的详情页/聊天页跳转。
-        if (!jobNameMatches(job.jobName || domInfo.jobName) || !salaryMatches(job, domInfo.salary)) {
+        // 名称/薪资筛选、名称黑名单和已沟通跳过都在点击沟通前完成，减少无意义的详情页/聊天页跳转。
+        const jobName = job.jobName || domInfo.jobName;
+        const jobNameMatched = jobNameMatches(jobName);
+        const salaryDecision = getSalaryFilterDecision(job, domInfo.salary);
+        if (!jobNameMatched || !salaryDecision.matched) {
+          const reasons = [];
+          if (!jobNameMatched) {
+            reasons.push(`名称不匹配（${normalizeText(config.jobNameFilterValue) || '未通过名称筛选'}）`);
+          }
+          if (!salaryDecision.matched) reasons.push(salaryDecision.reason);
+          const skipReason = `筛选跳过：${job.company || domInfo.company || '未知公司'} / ${jobName || '未知岗位'}（${reasons.join('；')}）`;
+          UI.setSkipStatus(skipReason);
+          logDebugEvent('skip_prefilter', {
+            cursorIndex,
+            reason: skipReason,
+            jobNameMatched,
+            salaryDecision,
+            job: summarizeJobForDebug(job),
+            domInfo: summarizeDomInfoForDebug(domInfo),
+          }, 'warn');
           RunState.patch(buildProcessedJobPatch(currentState, job, domInfo, captureJobListPosition(job)));
-          continue;
+          return 'processed';
         }
 
-        const blacklistDecision = findCompanyBlacklistMatch(job, domInfo.company);
-        if (blacklistDecision) {
-          await this.skipCompanyBlacklist(job, cursorIndex, blacklistDecision, domInfo);
+        const companyNameBlacklistDecision = findJobNameBlacklistMatch(job, domInfo.company);
+        if (companyNameBlacklistDecision) {
+          await this.skipTextBlacklist(job, cursorIndex, companyNameBlacklistDecision, domInfo, {
+            kind: 'company_name',
+            title: '名称黑名单',
+          });
           return 'processed';
         }
 
         if (config.skipContacted && ContactedIndex.has(job)) {
-          UI.setStatus(`本地记录已沟通，跳过：${job.jobName || ''} / ${job.company || ''}`, 'warn');
+          UI.setSkipStatus(`本地记录已沟通，跳过：${job.jobName || ''} / ${job.company || ''}`);
           await Database.saveJobRecord(job, {
             status: 'skipped_local_contacted',
             listIndex: cursorIndex,
@@ -4365,15 +4498,17 @@
       return 'done';
     },
 
-    // 公司黑名单命中时记录跳过原因并推进游标；该状态不会加入已沟通判重集合。
-    async skipCompanyBlacklist(job, cursorIndex, decision, domInfo) {
+    // 名称/JD 黑名单命中时记录具体规则和匹配文本，并推进当前列表游标。
+    async skipTextBlacklist(job, cursorIndex, decision, domInfo, options) {
       const rule = decision && decision.rule || {};
-      const matchedCompany = normalizeText(decision && decision.company) || getDisplayCompany(job) || '未知公司';
+      const kind = options && options.kind || 'text';
+      const title = options && options.title || '文本黑名单';
+      const matchedText = normalizeText(decision && decision.text) || '未知文本';
       const modeLabel = getCompanyMatchModeLabel(rule.mode);
-      UI.setStatus(`公司黑名单命中，跳过：${matchedCompany}`, 'warn');
-      logDebugEvent('skip_company_blacklist', {
+      UI.setSkipStatus(`${title}命中，跳过：${matchedText}`);
+      logDebugEvent(`skip_${kind}_blacklist`, {
         cursorIndex,
-        matchedCompany,
+        matchedText,
         rule: {
           mode: rule.mode,
           modeLabel,
@@ -4382,14 +4517,15 @@
         job: summarizeJobForDebug(job),
       }, 'warn');
       await Database.saveJobRecord(job, {
-        status: 'skipped_blacklist',
+        status: `skipped_${kind}_blacklist`,
         listIndex: cursorIndex,
         skippedAt: nowIso(),
-        skipReason: 'company_blacklist',
+        skipReason: `${kind}_blacklist`,
+        blacklistType: kind,
         blacklistMode: rule.mode,
         blacklistModeLabel: modeLabel,
         blacklistValue: rule.value,
-        blacklistMatchedCompany: matchedCompany,
+        blacklistMatchedText: matchedText,
         pageUrl: location.href,
       });
       const state = RunState.load() || {};
@@ -4457,15 +4593,18 @@
         domDetail: summarizeJobForDebug(domDetail),
       });
 
-      const blacklistDecision = findCompanyBlacklistMatch(job);
-      if (blacklistDecision) {
-        return this.skipCompanyBlacklist(job, cursorIndex, blacklistDecision, cardDomInfo);
+      const companyNameBlacklistDecision = findJobNameBlacklistMatch(job);
+      if (companyNameBlacklistDecision) {
+        return this.skipTextBlacklist(job, cursorIndex, companyNameBlacklistDecision, cardDomInfo, {
+          kind: 'company_name',
+          title: '名称黑名单',
+        });
       }
 
       const activeDecision = bossActiveMatches(job);
       if (!activeDecision.matched) {
         const activeText = activeDecision.activeText || '未识别';
-        UI.setStatus(`Boss活跃度不匹配，跳过：${activeText}`, 'warn');
+        UI.setSkipStatus(`Boss活跃度不匹配，跳过：${activeText}（已选：${activeDecision.selectedText || '未选择'}）`);
         logDebugEvent('skip_boss_active_filter', {
           cursorIndex,
           activeText,
@@ -4504,6 +4643,22 @@
         fullDetail: summarizeJobForDebug(fullDetail),
       });
 
+      const detailedJobNameBlacklistDecision = findJobNameBlacklistMatch(job);
+      if (detailedJobNameBlacklistDecision) {
+        return this.skipTextBlacklist(job, cursorIndex, detailedJobNameBlacklistDecision, cardDomInfo, {
+          kind: 'company_name',
+          title: '名称黑名单',
+        });
+      }
+
+      const jdBlacklistDecision = findJdBlacklistMatch(job);
+      if (jdBlacklistDecision) {
+        return this.skipTextBlacklist(job, cursorIndex, jdBlacklistDecision, cardDomInfo, {
+          kind: 'jd',
+          title: 'JD黑名单',
+        });
+      }
+
       await Database.saveJobRecord(job, {
         status: 'clicked',
         listIndex: cursorIndex,
@@ -4512,7 +4667,7 @@
       });
 
       if (/继续沟通/.test(buttonText) && config.skipContacted) {
-        UI.setStatus(`跳过已沟通：${job.jobName || ''} / ${job.company || ''}`, 'warn');
+        UI.setSkipStatus(`跳过已沟通：${job.jobName || ''} / ${job.company || ''}`);
         await Database.saveJobRecord(job, {
           status: 'skipped_contacted',
           chatButtonText: buttonText,
@@ -5314,6 +5469,31 @@
   }
 
   // 普通跨域文本请求，主要用于拉取 SheetJS CDN 脚本。
+  function parseUserScriptVersion(source) {
+    const match = String(source || '').match(/^\s*\/\/\s*@version\s+([^\r\n]+)/mi);
+    return match ? String(match[1] || '').trim().replace(/^v/i, '') : '';
+  }
+
+  function formatVersionLabel(version) {
+    const text = String(version || '').trim().replace(/^v/i, '');
+    return text ? `v${text}` : '--';
+  }
+
+  function compareVersionText(left, right) {
+    const parse = (value) => String(value || '')
+      .replace(/^v/i, '')
+      .split(/[.+-]/)
+      .map((part) => Number.parseInt(part, 10) || 0);
+    const a = parse(left);
+    const b = parse(right);
+    const length = Math.max(a.length, b.length);
+    for (let index = 0; index < length; index += 1) {
+      const difference = (a[index] || 0) - (b[index] || 0);
+      if (difference) return difference > 0 ? 1 : -1;
+    }
+    return 0;
+  }
+
   async function fetchText(url) {
     const response = await fetch(url, {
       cache: 'force-cache',
@@ -8000,7 +8180,7 @@
     target.dispatchEvent(new Ctor('keyup', eventInit));
   }
 
-  // 文本按模式匹配，供名称筛选和公司黑名单共用。
+    // 文本按模式匹配，供岗位名称筛选、公司名称黑名单和 JD 黑名单共用。
   function companyTextMatches(targetText, mode, valueText) {
     const target = normalizeText(targetText);
     const value = normalizeText(valueText);
@@ -8012,27 +8192,85 @@
     return target.includes(value);
   }
 
-  // 岗位名称筛选逻辑，支持精确、包含、正则三种模式。
+  // 岗位名称筛选固定为部分匹配；多个关键词以中文逗号/换行分隔，任意命中即可。
   function jobNameMatches(jobName) {
-    const value = normalizeText(config.jobNameFilterValue);
-    if (!value) return true;
-    return companyTextMatches(jobName, config.jobNameFilterMode, value);
+    const values = splitTextFilterValues(config.jobNameFilterValue);
+    if (!values.length) return true;
+    const target = normalizeText(jobName);
+    return Boolean(target && values.some((value) => target.includes(value)));
   }
 
-  // 薪资筛选按岗位展示的月薪范围判断；无法识别薪资时不通过已启用的薪资过滤。
-  function salaryMatches(job, fallbackSalary) {
+  // 薪资筛选按岗位展示的月薪范围判断，并返回可直接展示给用户的判定原因。
+  function getSalaryFilterDecision(job, fallbackSalary) {
     const min = Number(config.salaryMin);
     const max = Number(config.salaryMax);
     const hasMin = Number.isFinite(min) && min > 0;
     const hasMax = Number.isFinite(max) && max > 0;
-    if (!hasMin && !hasMax) return true;
+    if (!hasMin && !hasMax) {
+      return {
+        matched: true,
+        enabled: false,
+        unknown: false,
+        action: config.unknownSalaryAction,
+        salaryText: '',
+        range: null,
+        reason: '',
+      };
+    }
 
     const salaryText = getReadableSalary(getDisplaySalary(job)) || getReadableSalary(fallbackSalary);
     const range = parseSalaryRange(salaryText);
-    if (!range) return false;
-    if (hasMin && range.min < min) return false;
-    if (hasMax && range.max > max) return false;
-    return true;
+    if (!range) {
+      const shouldSkip = config.unknownSalaryAction === 'skip';
+      return {
+        matched: !shouldSkip,
+        enabled: true,
+        unknown: true,
+        action: shouldSkip ? 'skip' : 'ignore',
+        salaryText,
+        range: null,
+        reason: shouldSkip
+          ? '工资无法识别，按设置跳过该岗位'
+          : '工资无法识别，已忽略工资继续判断',
+      };
+    }
+
+    if (hasMin && range.min < min) {
+      return {
+        matched: false,
+        enabled: true,
+        unknown: false,
+        action: 'filter',
+        salaryText,
+        range,
+        reason: `工资下限 ${range.min}K 低于设定下限 ${min}K`,
+      };
+    }
+    if (hasMax && range.max > max) {
+      return {
+        matched: false,
+        enabled: true,
+        unknown: false,
+        action: 'filter',
+        salaryText,
+        range,
+        reason: `工资上限 ${Number.isFinite(range.max) ? `${range.max}K` : '无上限'} 高于设定上限 ${max}K`,
+      };
+    }
+
+    return {
+      matched: true,
+      enabled: true,
+      unknown: false,
+      action: 'filter',
+      salaryText,
+      range,
+      reason: '',
+    };
+  }
+
+  function salaryMatches(job, fallbackSalary) {
+    return getSalaryFilterDecision(job, fallbackSalary).matched;
   }
 
   // 收集岗位上可用于黑名单匹配的公司名，详情补全后会包含全称/简称。
@@ -8046,20 +8284,41 @@
     return Array.from(new Set(values.map(normalizeText).filter(Boolean)));
   }
 
-  // 任意一条公司黑名单规则命中即跳过，返回命中的规则和公司文本。
-  function findCompanyBlacklistMatch(job, fallbackCompany) {
-    const rules = normalizeCompanyBlacklistRules(config.companyBlacklistRules);
-    if (!rules.length) return null;
+  // 收集岗位 JD 候选文本；列表阶段通常没有完整 JD，因此只在详情补全后进行匹配。
+  function getJdBlacklistCandidates(job, fallbackDescription) {
+    const rawJob = job && job.rawJob || {};
+    const rawDetail = job && job.rawDetail || {};
+    const rawJobInfo = rawDetail.jobInfo || rawDetail.job || {};
+    const values = [
+      job && job.postDescription,
+      job && job.description,
+      job && job.jobDescription,
+      rawJob.postDescription,
+      rawJob.description,
+      rawJob.jobDescription,
+      rawDetail.postDescription,
+      rawDetail.description,
+      rawJobInfo.postDescription,
+      rawJobInfo.description,
+      rawJobInfo.jobDescription,
+      fallbackDescription,
+    ];
+    return Array.from(new Set(values.map(normalizeTextPreserveLines).filter(Boolean)));
+  }
 
-    const candidates = getCompanyMatchCandidates(job, fallbackCompany);
-    for (const rule of rules) {
-      for (const company of candidates) {
+  // 通用文本黑名单匹配；规则正则异常时只记录日志，不中断自动化流程。
+  function findTextBlacklistMatch(rules, candidates, logEventName) {
+    const normalizedRules = normalizeTextBlacklistRules(rules);
+    if (!normalizedRules.length) return null;
+
+    for (const rule of normalizedRules) {
+      for (const text of candidates || []) {
         try {
-          if (companyTextMatches(company, rule.mode, rule.value)) {
-            return { rule, company };
+          if (companyTextMatches(text, rule.mode, rule.value)) {
+            return { rule, text };
           }
         } catch (error) {
-          logDebugEvent('invalid_company_blacklist_rule', {
+          logDebugEvent(logEventName || 'invalid_text_blacklist_rule', {
             rule,
             error: error.message || String(error),
           }, 'warn');
@@ -8067,6 +8326,22 @@
       }
     }
     return null;
+  }
+
+  function findJobNameBlacklistMatch(job, fallbackCompany) {
+    return findTextBlacklistMatch(
+      normalizeTextBlacklistRules(config.jobNameBlacklistRules, 'partial'),
+      getCompanyMatchCandidates(job, fallbackCompany),
+      'invalid_company_name_blacklist_rule',
+    );
+  }
+
+  function findJdBlacklistMatch(job, fallbackDescription) {
+    return findTextBlacklistMatch(
+      normalizeTextBlacklistRules(config.jdBlacklistRules, 'partial'),
+      getJdBlacklistCandidates(job, fallbackDescription),
+      'invalid_jd_blacklist_rule',
+    );
   }
 
   // 根据当前配置判断岗位 Boss 活跃度是否命中，并返回可用于日志/UI 的判定信息。
@@ -8128,27 +8403,10 @@
       return '列表刷新上限不能小于 0';
     }
 
-    if (config.jobNameFilterMode === 'regex' && config.jobNameFilterValue) {
-      try {
-        new RegExp(config.jobNameFilterValue);
-      } catch (error) {
-        return `名称正则无效：${error.message}`;
-      }
-    }
-
     const salaryMin = Number(config.salaryMin);
     const salaryMax = Number(config.salaryMax);
     if (Number.isFinite(salaryMin) && Number.isFinite(salaryMax) && salaryMin > 0 && salaryMax > 0 && salaryMin > salaryMax) {
       return '工资下限不能大于工资上限';
-    }
-
-    for (const rule of normalizeCompanyBlacklistRules(config.companyBlacklistRules)) {
-      if (rule.mode !== 'regex') continue;
-      try {
-        new RegExp(rule.value);
-      } catch (error) {
-        return `公司黑名单正则无效：${rule.value} / ${error.message}`;
-      }
     }
 
     if (config.greetingMode === 'customText' && config.textSource === 'text' && !normalizeMessageText(config.customText)) {
@@ -9093,6 +9351,25 @@
         text-overflow: ellipsis;
         white-space: nowrap;
       }
+      #zhipin-auto-greeting-root .za-daily-count {
+        flex: 0 0 auto;
+        color: #101828;
+        font-size: 12px;
+        font-weight: 400;
+        line-height: 1.4;
+        white-space: nowrap;
+      }
+      #zhipin-auto-greeting-root .za-daily-count-value {
+        color: var(--za-primary);
+        font-weight: 700;
+      }
+      #zhipin-auto-greeting-root .za-salary-unknown-action {
+        margin-top: 10px;
+      }
+      #zhipin-auto-greeting-root .za-salary-unknown-action > select {
+        display: block;
+        margin-top: 5px;
+      }
       #zhipin-auto-greeting-root .za-header-actions {
         flex: 0 0 auto;
         display: flex;
@@ -9230,7 +9507,10 @@
         color: #b42318;
       }
       #zhipin-auto-greeting-root .za-section {
-        padding: 12px 14px 0;
+        padding: 16px 14px 0;
+      }
+      #zhipin-auto-greeting-root .za-section + .za-section {
+        padding-top: 18px;
       }
       #zhipin-auto-greeting-root .za-status + .za-section {
         padding-top: 20px;
@@ -9239,9 +9519,37 @@
         overflow-y: auto;
       }
       #zhipin-auto-greeting-root h3 {
-        margin: 0 0 8px;
-        font-size: 13px;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin: 0;
+        padding-bottom: 8px;
+        border-bottom: 1px solid #eef2f6;
+        font-size: 14px;
         font-weight: 700;
+      }
+      #zhipin-auto-greeting-root .za-subsection {
+        margin-top: 10px;
+        padding: 10px;
+        border: 1px solid #e5e9f0;
+        border-radius: 8px;
+        background: #fbfcfd;
+      }
+      #zhipin-auto-greeting-root .za-subsection + .za-subsection {
+        margin-top: 10px;
+      }
+      #zhipin-auto-greeting-root .za-subsection-title {
+        margin-bottom: 8px;
+        color: #344054;
+        font-size: 12px;
+        font-weight: 700;
+        letter-spacing: 0.02em;
+      }
+      #zhipin-auto-greeting-root .za-subsection > :first-child {
+        margin-top: 0;
+      }
+      #zhipin-auto-greeting-root .za-subsection > :last-child {
+        margin-bottom: 0;
       }
       #zhipin-auto-greeting-root label {
         display: block;
@@ -9263,8 +9571,14 @@
         resize: vertical;
         min-height: 76px;
       }
-      #zhipin-auto-greeting-root select[data-field="jobNameFilterMode"]:focus,
-      #zhipin-auto-greeting-root select[data-field="jobNameFilterMode"]:focus-visible,
+      #zhipin-auto-greeting-root textarea[data-field="jobNameFilterValue"],
+      #zhipin-auto-greeting-root textarea[data-field="jobNameBlacklistValue"],
+      #zhipin-auto-greeting-root textarea[data-field="jdBlacklistValue"] {
+        min-height: 76px;
+        max-height: 240px;
+        overflow-y: auto;
+        field-sizing: content;
+      }
       #zhipin-auto-greeting-root select[data-field="exportType"]:focus,
       #zhipin-auto-greeting-root select[data-field="exportType"]:focus-visible {
         outline: none;
@@ -9318,6 +9632,9 @@
         gap: 8px;
         align-items: center;
         margin-bottom: 8px;
+      }
+      #zhipin-auto-greeting-root .za-textarea-row {
+        align-items: flex-start;
       }
       #zhipin-auto-greeting-root .za-segment {
         display: grid;
@@ -9672,6 +9989,7 @@
         min-height: 16px;
       }
       #zhipin-auto-greeting-root .za-inline > * {
+        min-width: 0;
         flex: 1 1 auto;
       }
       #zhipin-auto-greeting-root .za-inline > button {
@@ -9679,8 +9997,22 @@
       }
       #zhipin-auto-greeting-root .za-grid-2 {
         display: grid;
-        grid-template-columns: 1fr 1fr;
-        gap: 8px;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 10px;
+      }
+      #zhipin-auto-greeting-root .za-grid-2 > label > input,
+      #zhipin-auto-greeting-root .za-cleanup-time > input {
+        display: block;
+        margin-top: 5px;
+      }
+      #zhipin-auto-greeting-root .za-radio-row {
+        flex-wrap: wrap;
+        margin-bottom: 0;
+      }
+      #zhipin-auto-greeting-root .za-check {
+        min-height: 30px;
+        margin: 0;
+        padding: 4px 0;
       }
       #zhipin-auto-greeting-root .za-label,
       #zhipin-auto-greeting-root .za-hint {
@@ -9690,6 +10022,63 @@
       }
       #zhipin-auto-greeting-root .za-list-section {
         padding-bottom: 24px;
+      }
+      #zhipin-auto-greeting-root .za-about-section {
+        padding-bottom: 22px;
+      }
+      #zhipin-auto-greeting-root .za-about-card {
+        display: grid;
+        gap: 8px;
+        margin-top: 10px;
+        padding: 10px;
+        border: 1px solid #e5e9f0;
+        border-radius: 8px;
+        background: #fbfcfd;
+      }
+      #zhipin-auto-greeting-root .za-about-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        min-height: 28px;
+      }
+      #zhipin-auto-greeting-root .za-about-row span {
+        color: var(--za-muted);
+      }
+      #zhipin-auto-greeting-root .za-about-row strong {
+        color: var(--za-text);
+        font-variant-numeric: tabular-nums;
+      }
+      #zhipin-auto-greeting-root .za-about-actions {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+        padding-top: 8px;
+        border-top: 1px solid #e5e9f0;
+      }
+      #zhipin-auto-greeting-root .za-about-status {
+        min-width: 0;
+        color: var(--za-muted);
+        font-size: 12px;
+        overflow-wrap: anywhere;
+      }
+      #zhipin-auto-greeting-root .za-about-status[data-type="ok"] {
+        color: #027a48;
+      }
+      #zhipin-auto-greeting-root .za-about-status[data-type="warn"] {
+        color: #b54708;
+      }
+      #zhipin-auto-greeting-root .za-about-status[data-type="error"] {
+        color: #b42318;
+      }
+      #zhipin-auto-greeting-root .za-about-link {
+        color: #007f80;
+        font-size: 12px;
+        text-decoration: none;
+      }
+      #zhipin-auto-greeting-root .za-about-link:hover {
+        text-decoration: underline;
       }
       #zhipin-auto-greeting-root .za-list-viewport {
         position: relative;
@@ -9759,6 +10148,39 @@
         justify-content: flex-end;
         gap: 8px;
         margin-top: 16px;
+      }
+      @media (max-width: 520px) {
+        #zhipin-auto-greeting-root {
+          --za-width: min(430px, 100vw);
+        }
+        #zhipin-auto-greeting-root .za-header,
+        #zhipin-auto-greeting-root .za-footer {
+          padding-left: 10px;
+          padding-right: 10px;
+        }
+        #zhipin-auto-greeting-root .za-section {
+          padding-left: 10px;
+          padding-right: 10px;
+        }
+        #zhipin-auto-greeting-root .za-grid-2,
+        #zhipin-auto-greeting-root .za-api-endpoint {
+          grid-template-columns: 1fr;
+        }
+        #zhipin-auto-greeting-root .za-textarea-row {
+          flex-direction: column;
+          align-items: stretch;
+        }
+        #zhipin-auto-greeting-root .za-textarea-row > * {
+          flex: 0 0 auto;
+          width: 100%;
+        }
+        #zhipin-auto-greeting-root .za-about-actions {
+          align-items: stretch;
+          flex-direction: column;
+        }
+        #zhipin-auto-greeting-root .za-about-actions button {
+          width: 100%;
+        }
       }
     `;
 

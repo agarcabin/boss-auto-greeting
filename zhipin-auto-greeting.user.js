@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BOSS直聘自动沟通助手
 // @namespace    local.codex.zhipin
-// @version      0.1.9
+// @version      0.1.10
 // @description  在 BOSS 直聘搜索结果页自动选择岗位、发送常用语或自定义问候语，并记录岗位数据。
 // @match        https://www.zhipin.com/web/geek/jobs*
 // @match        https://www.zhipin.com/web/geek/chat*
@@ -116,9 +116,11 @@
     waitTimeout: 5,
     chatOpenRetries: 2,
     maxCount: 0,
-    // 公司过滤和数据维护选项。
-    companyFilterMode: 'partial',
-    companyFilterValue: '',
+    // 岗位名称/薪资过滤和数据维护选项。
+    jobNameFilterMode: 'partial',
+    jobNameFilterValue: '',
+    salaryMin: '',
+    salaryMax: '',
     companyBlacklistMode: 'partial',
     companyBlacklistValue: '',
     companyBlacklistRules: [],
@@ -166,7 +168,7 @@
     resumeInProgress: false,
     stopRequested: false,
     statusLock: null,
-    companyFilterEdited: false,
+    jobNameFilterEdited: false,
     configFormTouched: false,
     // 外部库、UI 和数据库连接缓存。
     xlsx: null,
@@ -230,7 +232,10 @@
     CONFIG_FIELD_KEYS.forEach((key) => {
       next[key] = raw[key] === undefined ? DEFAULT_CONFIG[key] : raw[key];
     });
-    next.companyFilterMode = getCompanyMatchMode(next.companyFilterMode);
+    next.jobNameFilterMode = getCompanyMatchMode(next.jobNameFilterMode);
+    next.jobNameFilterValue = normalizeText(next.jobNameFilterValue);
+    next.salaryMin = normalizeSalaryBound(next.salaryMin);
+    next.salaryMax = normalizeSalaryBound(next.salaryMax);
     next.companyBlacklistMode = getCompanyMatchMode(next.companyBlacklistMode);
     next.companyBlacklistValue = normalizeText(next.companyBlacklistValue);
     next.companyBlacklistRules = normalizeCompanyBlacklistRules(next.companyBlacklistRules);
@@ -272,6 +277,13 @@
   // 公司匹配模式统一归一，避免旧配置或手动编辑的异常值影响过滤。
   function getCompanyMatchMode(mode) {
     return /^(?:exact|partial|regex)$/.test(String(mode || '')) ? String(mode) : 'partial';
+  }
+
+  // 薪资边界使用 K 作为单位；空值、0 和非法值都代表未启用该边界。
+  function normalizeSalaryBound(value) {
+    if (value == null || String(value).trim() === '') return '';
+    const number = Number(value);
+    return Number.isFinite(number) && number > 0 ? number : '';
   }
 
   // 黑名单列表中展示给用户看的匹配模式标签。
@@ -470,7 +482,7 @@
     pageWindow.addEventListener('hashchange', () => setTimeout(syncAllowedPageUi, 0));
   }
 
-  // 当前搜索词会作为公司过滤输入框的默认值，但用户手动编辑后不再自动覆盖。
+  // 当前搜索词会作为岗位名称过滤输入框的默认值，但用户手动编辑后不再自动覆盖。
   function getCurrentSearchQuery() {
     try {
       return normalizeText(new URL(location.href).searchParams.get('query'));
@@ -2679,14 +2691,20 @@
 
           <section class="za-section" data-feature-section="companyFilter">
             <h3>公司筛选</h3>
+            <label class="za-label">名称筛选</label>
             <div class="za-inline">
-              <select data-field="companyFilterMode">
+              <select data-field="jobNameFilterMode">
                 <option value="exact">全量匹配</option>
                 <option value="partial">部分匹配</option>
                 <option value="regex">正则匹配</option>
               </select>
-              <input data-field="companyFilterValue" type="text" autocomplete="off" spellcheck="false" placeholder="留空则不过滤">
+              <input data-field="jobNameFilterValue" type="text" autocomplete="off" spellcheck="false" placeholder="留空则不过滤">
             </div>
+            <div class="za-grid-2">
+              <label>工资下限不低于(K)<input data-field="salaryMin" data-empty-as-blank="true" type="number" min="0" step="0.1" placeholder="留空不启用"></label>
+              <label>工资上限不高于(K)<input data-field="salaryMax" data-empty-as-blank="true" type="number" min="0" step="0.1" placeholder="留空不启用"></label>
+            </div>
+            <p class="za-hint">薪资按月薪 K 计算；工资上下限均留空时不启用薪资过滤。</p>
           </section>
 
           <section class="za-section" data-feature-section="companyBlacklist">
@@ -2968,7 +2986,7 @@
           return;
         }
         if (this.shouldIgnoreConfigFieldEvent(event)) return;
-        this.noteCompanyFilterEdit(event);
+        this.noteJobNameFilterEdit(event);
         this.saveFormToConfig({ event });
       });
       root.addEventListener('change', (event) => {
@@ -2977,7 +2995,7 @@
           return;
         }
         if (this.shouldIgnoreConfigFieldEvent(event)) return;
-        this.noteCompanyFilterEdit(event);
+        this.noteJobNameFilterEdit(event);
         if (event.target && event.target.dataset && event.target.dataset.role === 'companyBlacklistRuleOption') {
           this.setCompanyBlacklistRuleSelected(event.target.value, event.target.checked, true);
           return;
@@ -3121,7 +3139,10 @@
     readConfigFieldValue(field) {
       if (!field) return '';
       if (field.type === 'checkbox') return Boolean(field.checked);
-      if (field.type === 'number') return Number(field.value || 0);
+      if (field.type === 'number') {
+        if (field.dataset.emptyAsBlank === 'true' && !String(field.value || '').trim()) return '';
+        return Number(field.value || 0);
+      }
       return field.value;
     },
 
@@ -3223,7 +3244,7 @@
     // 将配置写回表单控件，页面刷新或首次挂载时调用。
     applyConfigToForm() {
       const root = runtime.ui.root;
-      this.clearAutoSyncedCompanyFilter();
+      this.clearAutoSyncedJobNameFilter();
 
       root.querySelectorAll('input[name="za-greeting-mode"]').forEach((input) => {
         input.checked = input.value === config.greetingMode;
@@ -3276,8 +3297,8 @@
       if (eventField) {
         const key = eventField.dataset.field;
         if (!CONFIG_FIELD_KEY_SET.has(key)) return;
-        if (key === 'companyFilterValue' && !this.shouldSaveCompanyFilterValue(eventField, eventTarget)) {
-          delete next.companyFilterValue;
+        if (key === 'jobNameFilterValue' && !this.shouldSaveJobNameFilterValue(eventField, eventTarget)) {
+          delete next.jobNameFilterValue;
         } else {
           next[key] = this.readConfigFieldValue(eventField);
         }
@@ -3293,30 +3314,30 @@
       saveConfig(next);
     },
 
-    // 标记公司过滤输入框是否被用户手动编辑，避免被搜索词自动覆盖。
-    noteCompanyFilterEdit(event) {
+    // 标记岗位名称过滤输入框是否被用户手动编辑，避免被搜索词自动覆盖。
+    noteJobNameFilterEdit(event) {
       const target = event && event.target;
-      if (target && target.dataset && target.dataset.field === 'companyFilterValue') {
-        runtime.companyFilterEdited = true;
+      if (target && target.dataset && target.dataset.field === 'jobNameFilterValue') {
+        runtime.jobNameFilterEdited = true;
         target.dataset.userEdited = 'true';
       }
     },
 
-    // 判断公司过滤值是否应该写入配置，区分自动同步和用户输入。
-    shouldSaveCompanyFilterValue(field, eventTarget) {
+    // 判断岗位名称过滤值是否应该写入配置，区分自动同步和用户输入。
+    shouldSaveJobNameFilterValue(field, eventTarget) {
       if (!field) return false;
-      if (runtime.companyFilterEdited || field.dataset.userEdited === 'true') return true;
+      if (runtime.jobNameFilterEdited || field.dataset.userEdited === 'true') return true;
       if (eventTarget === field) return true;
       return normalizeText(field.value) !== normalizeText(getCurrentSearchQuery());
     },
 
-    // 用户切换过滤模式时，如果过滤值只是自动同步的搜索词，则清空。
-    clearAutoSyncedCompanyFilter() {
+    // 用户进入新的搜索页时，如果名称过滤值只是自动同步的搜索词，则清空。
+    clearAutoSyncedJobNameFilter() {
       const query = normalizeText(getCurrentSearchQuery());
-      if (!query || !config.companyFilterValue) return;
-      if (normalizeText(config.companyFilterValue) !== query) return;
+      if (!query || !config.jobNameFilterValue) return;
+      if (normalizeText(config.jobNameFilterValue) !== query) return;
 
-      saveConfig({ companyFilterValue: '' });
+      saveConfig({ jobNameFilterValue: '' });
     },
 
     // 根据问候语模式/自定义文本来源，显示或隐藏对应配置块。
@@ -4313,8 +4334,8 @@
           listState: getDebugListState(),
         });
 
-        // 公司筛选、黑名单和已沟通跳过都在点击沟通前完成，减少无意义的详情页/聊天页跳转。
-        if (!companyMatches(job.company || domInfo.company)) {
+        // 名称/薪资筛选、公司黑名单和已沟通跳过都在点击沟通前完成，减少无意义的详情页/聊天页跳转。
+        if (!jobNameMatches(job.jobName || domInfo.jobName) || !salaryMatches(job, domInfo.salary)) {
           RunState.patch(buildProcessedJobPatch(currentState, job, domInfo, captureJobListPosition(job)));
           continue;
         }
@@ -6565,10 +6586,12 @@
       const text = normalizeText(root.innerText || root.textContent || '');
       if (!text || text.length < 6 || text.length > 500) continue;
 
+      const sentMessageConfirmation = /已向\s*BOSS\s*发送消息/i.test(text) && /继续沟通/.test(text);
       const softReminder = /温馨提示/.test(text) && /沟通/.test(text)
         || /还剩\s*\d+\s*次沟通/.test(text)
         || /您今天已与\s*\d+\s*位/.test(text)
-        || /沟通机会/.test(text) && /今天已与|还剩/.test(text);
+        || /沟通机会/.test(text) && /今天已与|还剩/.test(text)
+        || sentMessageConfirmation;
       const hardLimit = /今日沟通(?:次数)?已(?:用完|达上限)|沟通次数(?:已)?(?:用完|达上限)|无法继续沟通|今日无法再沟通|已达(?:到)?沟通上限/.test(text);
       if (!softReminder && !hardLimit) continue;
 
@@ -6576,7 +6599,7 @@
         .filter((button) => !isOwnUiElement(button) && isVisible(button));
       const confirmButton = buttons.find((button) => {
         const label = normalizeText(button.innerText || button.textContent || button.getAttribute('aria-label') || '');
-        return /^(确定|知道了|我知道了|继续|关闭)$/.test(label);
+        return /^(确定|知道了|我知道了|继续|继续沟通|关闭)$/.test(label);
       }) || buttons.find((button) => {
         const label = normalizeText(button.innerText || button.textContent || button.getAttribute('aria-label') || '');
         return /确定|知道了|我知道了/.test(label) && !/取消|开通|升级|购买|查看权益/.test(label);
@@ -7977,7 +8000,7 @@
     target.dispatchEvent(new Ctor('keyup', eventInit));
   }
 
-  // 公司名按模式匹配，供公司筛选和黑名单共用。
+  // 文本按模式匹配，供名称筛选和公司黑名单共用。
   function companyTextMatches(targetText, mode, valueText) {
     const target = normalizeText(targetText);
     const value = normalizeText(valueText);
@@ -7989,11 +8012,27 @@
     return target.includes(value);
   }
 
-  // 公司筛选逻辑，支持精确、包含、正则三种模式。
-  function companyMatches(company) {
-    const value = normalizeText(config.companyFilterValue);
+  // 岗位名称筛选逻辑，支持精确、包含、正则三种模式。
+  function jobNameMatches(jobName) {
+    const value = normalizeText(config.jobNameFilterValue);
     if (!value) return true;
-    return companyTextMatches(company, config.companyFilterMode, value);
+    return companyTextMatches(jobName, config.jobNameFilterMode, value);
+  }
+
+  // 薪资筛选按岗位展示的月薪范围判断；无法识别薪资时不通过已启用的薪资过滤。
+  function salaryMatches(job, fallbackSalary) {
+    const min = Number(config.salaryMin);
+    const max = Number(config.salaryMax);
+    const hasMin = Number.isFinite(min) && min > 0;
+    const hasMax = Number.isFinite(max) && max > 0;
+    if (!hasMin && !hasMax) return true;
+
+    const salaryText = getReadableSalary(getDisplaySalary(job)) || getReadableSalary(fallbackSalary);
+    const range = parseSalaryRange(salaryText);
+    if (!range) return false;
+    if (hasMin && range.min < min) return false;
+    if (hasMax && range.max > max) return false;
+    return true;
   }
 
   // 收集岗位上可用于黑名单匹配的公司名，详情补全后会包含全称/简称。
@@ -8089,12 +8128,18 @@
       return '列表刷新上限不能小于 0';
     }
 
-    if (config.companyFilterMode === 'regex' && config.companyFilterValue) {
+    if (config.jobNameFilterMode === 'regex' && config.jobNameFilterValue) {
       try {
-        new RegExp(config.companyFilterValue);
+        new RegExp(config.jobNameFilterValue);
       } catch (error) {
-        return `公司正则无效：${error.message}`;
+        return `名称正则无效：${error.message}`;
       }
+    }
+
+    const salaryMin = Number(config.salaryMin);
+    const salaryMax = Number(config.salaryMax);
+    if (Number.isFinite(salaryMin) && Number.isFinite(salaryMax) && salaryMin > 0 && salaryMax > 0 && salaryMin > salaryMax) {
+      return '工资下限不能大于工资上限';
     }
 
     for (const rule of normalizeCompanyBlacklistRules(config.companyBlacklistRules)) {
@@ -8347,6 +8392,38 @@
       if (value) return value;
     }
     return '';
+  }
+
+  // 将 BOSS 常见的月薪文本转换为 K 单位的上下限，例如 15-25K、1-2万/月、5000-8000元/月。
+  function parseSalaryRange(value) {
+    const text = normalizeText(value).replace(/[，,]/g, '');
+    if (!text || /面议|保密/i.test(text)) return null;
+
+    const match = text.match(/(\d+(?:\.\d+)?)\s*(?:[-~至到]\s*(\d+(?:\.\d+)?))?/);
+    if (!match) return null;
+
+    const first = Number(match[1]);
+    const second = match[2] == null ? first : Number(match[2]);
+    if (!Number.isFinite(first) || !Number.isFinite(second)) return null;
+
+    let multiplier = 1;
+    if (/万|\bw\b/i.test(text)) {
+      multiplier = 10;
+    } else if (/元|¥|￥|\brmb\b/i.test(text)) {
+      multiplier = 0.001;
+    } else if (!/(?:k|千)/i.test(text) && Math.max(first, second) >= 1000) {
+      multiplier = 0.001;
+    }
+
+    let min = Math.min(first, second) * multiplier;
+    let max = Math.max(first, second) * multiplier;
+    if (match[2] == null && /以上|起薪|起步|不低于/.test(text)) {
+      max = Infinity;
+    } else if (match[2] == null && /以下|以内|封顶|不高于/.test(text)) {
+      min = 0;
+    }
+
+    return { min, max };
   }
 
   // 生成岗位详情匹配 key，允许列表岗位和详情岗位互相找到。
@@ -9186,8 +9263,8 @@
         resize: vertical;
         min-height: 76px;
       }
-      #zhipin-auto-greeting-root select[data-field="companyFilterMode"]:focus,
-      #zhipin-auto-greeting-root select[data-field="companyFilterMode"]:focus-visible,
+      #zhipin-auto-greeting-root select[data-field="jobNameFilterMode"]:focus,
+      #zhipin-auto-greeting-root select[data-field="jobNameFilterMode"]:focus-visible,
       #zhipin-auto-greeting-root select[data-field="exportType"]:focus,
       #zhipin-auto-greeting-root select[data-field="exportType"]:focus-visible {
         outline: none;

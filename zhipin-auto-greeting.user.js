@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BOSS直聘自动沟通助手
 // @namespace    local.codex.zhipin
-// @version      0.1.12
+// @version      0.1.13
 // @description  在 BOSS 直聘搜索结果页自动选择岗位、发送常用语或自定义问候语，并记录岗位数据。
 // @match        https://www.zhipin.com/web/geek/jobs*
 // @match        https://www.zhipin.com/web/geek/chat*
@@ -38,12 +38,13 @@
   // 全局常量：集中维护脚本版本、存储 key、BOSS 接口特征和默认问候语。
   const APP = {
     name: 'BOSS自动沟通',
-    version: '0.1.12',
+    version: '0.1.13',
     githubVersionUrl: 'https://raw.githubusercontent.com/agarcabin/boss-auto-greeting/main/zhipin-auto-greeting.user.js',
     dbName: 'ZhipinAutoGreetingDB',
     dbVersion: 1,
     configKey: '__zhipin_auto_greeting_config__',
     runKey: '__zhipin_auto_greeting_run_state__',
+    dailyDeliveryCorrectionKey: '__zhipin_auto_greeting_daily_delivery_correction__',
     debugEnabledKey: '__zhipin_auto_greeting_debug_enabled__',
     debugEventsKey: '__zhipin_auto_greeting_debug_events__',
     maxDebugEvents: 300,
@@ -3924,7 +3925,9 @@
     refreshDailyDeliveryCount(rows) {
       if (!runtime.ui || !runtime.ui.dailyDeliveryCount) return;
 
-      const count = countTodayDeliveredRows(Array.isArray(rows) ? rows : runtime.ui.greetedRows);
+      const recordedCount = countTodayDeliveredRows(Array.isArray(rows) ? rows : runtime.ui.greetedRows);
+      // BOSS 的“今日已与 X 位 BOSS 沟通”提示是平台侧权威计数；本地记录可能会比它少一条。
+      const count = Math.max(recordedCount, loadDailyDeliveryCorrection());
       const limit = APP.dailyDeliveryLimit;
       if (runtime.ui.dailyDeliveryCountValue) {
         runtime.ui.dailyDeliveryCountValue.textContent = count;
@@ -3933,6 +3936,19 @@
       }
       runtime.ui.dailyDeliveryCount.title = `今日已成功发送 ${count} 条沟通消息，上限 ${limit} 条`;
       runtime.ui.dailyDeliveryCount.setAttribute('aria-label', `今日已投递 ${count} 条，共 ${limit} 条上限`);
+    },
+
+    // 接收到 BOSS 平台侧的当天沟通人数后，保存校正值并立即刷新标题栏计数。
+    syncDailyDeliveryCountFromBossDialog(count) {
+      const normalizedCount = normalizeDailyDeliveryCount(count);
+      if (normalizedCount === null) return null;
+
+      const previousCorrection = loadDailyDeliveryCorrection();
+      const nextCorrection = Math.max(previousCorrection, normalizedCount);
+      saveDailyDeliveryCorrection(nextCorrection);
+      this.refreshDailyDeliveryCount();
+      this.setStatus(`已同步 BOSS 今日沟通次数：${nextCorrection}/${APP.dailyDeliveryLimit}`, 'ok');
+      return nextCorrection;
     },
 
     // 每天本地零点重新读取一次列表，让日期变化后计数自动归零。
@@ -4018,6 +4034,46 @@
       const timestamp = Date.parse(communicationTime || '');
       return Number.isFinite(timestamp) && getLocalDateKey(new Date(timestamp)) === today;
     }).length;
+  }
+
+  // 仅接受当天有效的整数校正值，避免旧日期或异常弹窗内容污染标题栏计数。
+  function normalizeDailyDeliveryCount(value) {
+    const count = Number(value);
+    if (!Number.isInteger(count) || count < 0 || count > APP.dailyDeliveryLimit) return null;
+    return count;
+  }
+
+  // BOSS 平台侧的沟通人数校正只保存当天；跨天后自动丢弃，计数随本地记录重新开始。
+  function loadDailyDeliveryCorrection() {
+    try {
+      const raw = localStorage.getItem(APP.dailyDeliveryCorrectionKey);
+      if (!raw) return 0;
+
+      const payload = JSON.parse(raw);
+      if (!payload || payload.dateKey !== getLocalDateKey(new Date())) {
+        localStorage.removeItem(APP.dailyDeliveryCorrectionKey);
+        return 0;
+      }
+      return normalizeDailyDeliveryCount(payload.count) || 0;
+    } catch (error) {
+      console.warn('[ZhipinAuto] 读取当天投递计数校正失败', error);
+      return 0;
+    }
+  }
+
+  function saveDailyDeliveryCorrection(count) {
+    const normalizedCount = normalizeDailyDeliveryCount(count);
+    if (normalizedCount === null) return;
+
+    try {
+      localStorage.setItem(APP.dailyDeliveryCorrectionKey, JSON.stringify({
+        dateKey: getLocalDateKey(new Date()),
+        count: normalizedCount,
+        updatedAt: nowIso(),
+      }));
+    } catch (error) {
+      console.warn('[ZhipinAuto] 保存当天投递计数校正失败', error);
+    }
   }
 
   function getLocalDateKey(date) {
@@ -6775,11 +6831,13 @@
       const hardLimit = /今日沟通(?:次数)?已(?:用完|达上限)|沟通次数(?:已)?(?:用完|达上限)|无法继续沟通|今日无法再沟通|已达(?:到)?沟通上限/.test(text);
       if (!softReminder && !hardLimit) continue;
 
+      const communicationCount = parseBossCommunicationCount(text);
+
       const buttons = Array.from(root.querySelectorAll('button, a, [role="button"], .btn, [class*="btn"]'))
         .filter((button) => !isOwnUiElement(button) && isVisible(button));
       const confirmButton = buttons.find((button) => {
         const label = normalizeText(button.innerText || button.textContent || button.getAttribute('aria-label') || '');
-        return /^(确定|知道了|我知道了|继续|继续沟通|关闭)$/.test(label);
+        return /^(确定|知道了|我知道了|继续|继续沟通|关闭|好)$/.test(label);
       }) || buttons.find((button) => {
         const label = normalizeText(button.innerText || button.textContent || button.getAttribute('aria-label') || '');
         return /确定|知道了|我知道了/.test(label) && !/取消|开通|升级|购买|查看权益/.test(label);
@@ -6791,6 +6849,7 @@
           root,
           text,
           kind: hardLimit ? 'hard_limit' : 'soft_reminder',
+          communicationCount,
           confirmButton: confirmButton || null,
           score,
         };
@@ -6800,6 +6859,15 @@
     return best;
   }
 
+  // 从 BOSS “您今天已与 X 位 BOSS 沟通”提示中提取平台侧当天计数。
+  function parseBossCommunicationCount(text) {
+    const normalized = normalizeText(text || '');
+    const match = normalized.match(/(?:您)?今天已与\s*(\d+)\s*位\s*BOSS\s*沟通/i)
+      || normalized.match(/已与\s*(\d+)\s*位\s*BOSS\s*沟通/i);
+    if (!match) return null;
+    return normalizeDailyDeliveryCount(match[1]);
+  }
+
   // 生成沟通上限暂停文案，避免把整段弹窗原文塞进状态栏。
   function formatBossDialogPauseMessage(dialog) {
     const text = normalizeText(dialog && dialog.text || '');
@@ -6807,7 +6875,7 @@
     return short ? `沟通受限，已暂停：${short}` : '沟通次数已达上限，已暂停';
   }
 
-  // 检查并处理平台弹窗：软提醒可点击确定；硬限制只返回结果，由调用方 pause。
+  // 检查并处理平台弹窗：软提醒可点击确认；硬限制只返回结果，由调用方 pause。
   function inspectBossPlatformDialog(options) {
     const settings = options || {};
     const dialog = findBossPlatformDialog();
@@ -6816,7 +6884,17 @@
     if (dialog.kind === 'soft_reminder' && settings.dismissSoft && dialog.confirmButton) {
       const lastAt = Number(runtime.lastBossDialogDismissAt || 0);
       if (Date.now() - lastAt > 900) {
-        UI.setStatus('检测到沟通提醒弹窗，正在点击确定...', 'warn');
+        UI.setStatus('检测到沟通提醒弹窗，正在点击确认...', 'warn');
+        if (dialog.communicationCount !== null && dialog.communicationCount !== undefined) {
+          const syncedCount = UI.syncDailyDeliveryCountFromBossDialog(dialog.communicationCount);
+          logDebugEvent('boss_daily_delivery_count_sync', {
+            source: 'platform_dialog',
+            dialogCount: dialog.communicationCount,
+            syncedCount,
+            text: summarizeLongText(dialog.text),
+          });
+        }
+
         logDebugEvent('boss_platform_dialog_dismiss', {
           kind: dialog.kind,
           text: summarizeLongText(dialog.text),

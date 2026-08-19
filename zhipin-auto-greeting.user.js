@@ -5,6 +5,7 @@
 // @description  在 BOSS 直聘搜索结果页自动选择岗位、发送常用语或自定义问候语，并记录岗位数据。
 // @match        https://www.zhipin.com/web/geek/jobs*
 // @match        https://www.zhipin.com/web/geek/chat*
+// @match        https://www.zhipin.com/web/passport/zp/403.html*
 // @run-at       document-start
 // @grant        unsafeWindow
 // @grant        GM_xmlhttpRequest
@@ -47,7 +48,11 @@
     dailyDeliveryCorrectionKey: '__zhipin_auto_greeting_daily_delivery_correction__',
     debugEnabledKey: '__zhipin_auto_greeting_debug_enabled__',
     debugEventsKey: '__zhipin_auto_greeting_debug_events__',
+    refreshHistoryKey: '__zhipin_auto_greeting_refresh_history__',
     maxDebugEvents: 300,
+    refreshCooldownMs: 60 * 1000,
+    refreshWindowMs: 60 * 60 * 1000,
+    maxAutoRefreshesPerHour: 3,
     jobListApiPattern: /\/wapi\/zpgeek\/(?:search\/joblist|pc\/(?:recommend|search)\/job\/list)\.json/i,
     jobDetailApiPattern: /\/wapi\/zpgeek\/job\/detail\.json/i,
     fastReplyUrl: '/wapi/zpchat/fastReply/userFastReplyList/get',
@@ -111,13 +116,14 @@
     skipContacted: true,
     collectGreetedJobs: true,
     ignoreListRefresh: true,
-    // 当前列表扫完后是否整页刷新续跑；刷新次数上限 0 表示不限制。
+    // 当前列表扫完后是否整页刷新续跑；刷新上限按最近一小时统计，最大不超过 3 次。
     autoRefreshOnExhausted: true,
-    maxListRefresh: 5,
+    maxListRefresh: 3,
     delayMin: 4,
     delayMax: 8,
     waitTimeout: 5,
-    chatOpenRetries: 2,
+    // 旧版字段仅为兼容存储；现在网络/页面/点击异常统一暂停，不自动重试。
+    chatOpenRetries: 0,
     maxCount: 0,
     // 岗位名称/薪资过滤和数据维护选项。
     // 名称类筛选统一使用部分匹配；保留字段仅用于兼容旧版配置。
@@ -190,6 +196,7 @@
     db: null,
     latestVersion: '',
     latestVersionRequest: null,
+    lastRestrictedPageHref: '',
   };
 
   let config = loadConfig();
@@ -205,6 +212,9 @@
   function bootWhenReady() {
     if (runtime.ui) {
       setUiDisplayEnabled(isAllowedDisplayPage());
+      const restrictedPage = isBossAccessRestrictedPage();
+      UI.setRestrictedPageMode(restrictedPage);
+      if (restrictedPage) handleBossAccessRestrictedPage('route');
       return;
     }
     if (!isAllowedDisplayPage()) return;
@@ -214,7 +224,11 @@
       Database.open().catch((error) => console.warn('[ZhipinAuto] IndexedDB 初始化失败', error));
       UI.mount();
       setUiDisplayEnabled(true);
-      Automation.resumeIfNeeded('boot');
+      if (isBossAccessRestrictedPage()) {
+        handleBossAccessRestrictedPage('boot');
+      } else {
+        Automation.resumeIfNeeded('boot');
+      }
     };
 
     if (document.body) {
@@ -294,6 +308,10 @@
     next.jdBlacklistMode = 'partial';
     next.jdBlacklistValue = normalizeTextFilterInput(next.jdBlacklistValue);
     next.jdBlacklistRules = normalizeTextBlacklistRules(next.jdBlacklistRules, 'partial');
+    const configuredRefreshLimit = Number(next.maxListRefresh);
+    next.maxListRefresh = Number.isFinite(configuredRefreshLimit) && configuredRefreshLimit > 0
+      ? Math.min(APP.maxAutoRefreshesPerHour, Math.floor(configuredRefreshLimit))
+      : DEFAULT_CONFIG.maxListRefresh;
     next.bossActiveCustomOptions = normalizeBossActiveOptions(next.bossActiveCustomOptions)
       .filter((item) => !BOSS_ACTIVE_BUILTIN_KEYS.has(normalizeBossActiveText(item)));
 
@@ -470,6 +488,7 @@
       const url = new URL(href || location.href, location.href);
       if (url.origin !== 'https://www.zhipin.com') return false;
       const pathname = url.pathname.replace(/\/+$/, '');
+      if (isBossAccessRestrictedUrl(url.href)) return true;
       if (pathname === '/web/geek/chat') return true;
       return isJobListUrl(url.href);
     } catch (_) {
@@ -485,6 +504,20 @@
     } catch (_) {
       return false;
     }
+  }
+
+  // BOSS 访问受限页是独立文档地址，脚本需要单独匹配并只展示诊断工具，不恢复自动化。
+  function isBossAccessRestrictedUrl(href) {
+    try {
+      const url = new URL(href || location.href, location.href);
+      return url.origin === 'https://www.zhipin.com' && url.pathname.replace(/\/+$/, '') === '/web/passport/zp/403.html';
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function isBossAccessRestrictedPage() {
+    return isBossAccessRestrictedUrl(location.href);
   }
 
   // 生成岗位筛选上下文签名；分页、追踪和随机参数不会影响“是否仍是同一筛选页”的判断。
@@ -654,6 +687,67 @@
     } catch (_) {}
   }
 
+  // 自动刷新频率独立于 RunState 持久化，避免页面重载或重新点击“开始”清零一小时限流。
+  function loadAutoRefreshHistory(now) {
+    const currentTime = Number(now || Date.now());
+    let parsed = [];
+    try {
+      const stored = JSON.parse(localStorage.getItem(APP.refreshHistoryKey) || '[]');
+      parsed = Array.isArray(stored) ? stored : [];
+    } catch (_) {}
+
+    const recent = parsed
+      .map((item) => Number(item))
+      .filter((timestamp) => Number.isFinite(timestamp) && timestamp > 0 && timestamp <= currentTime && currentTime - timestamp < APP.refreshWindowMs)
+      .sort((left, right) => left - right);
+
+    if (recent.length !== parsed.length) {
+      try {
+        localStorage.setItem(APP.refreshHistoryKey, JSON.stringify(recent));
+      } catch (_) {}
+    }
+    return recent;
+  }
+
+  function saveAutoRefreshHistory(timestamps) {
+    try {
+      localStorage.setItem(APP.refreshHistoryKey, JSON.stringify(timestamps));
+    } catch (_) {}
+  }
+
+  function getConfiguredAutoRefreshLimit() {
+    const configured = Number(config && config.maxListRefresh);
+    if (!Number.isFinite(configured) || configured <= 0) return APP.maxAutoRefreshesPerHour;
+    return Math.min(APP.maxAutoRefreshesPerHour, Math.floor(configured));
+  }
+
+  function getAutoRefreshWindowState(now) {
+    const currentTime = Number(now || Date.now());
+    const timestamps = loadAutoRefreshHistory(currentTime);
+    const lastRefreshAt = timestamps.length ? timestamps[timestamps.length - 1] : 0;
+    return {
+      timestamps,
+      count: timestamps.length,
+      limit: getConfiguredAutoRefreshLimit(),
+      lastRefreshAt,
+      nextAllowedAt: lastRefreshAt ? lastRefreshAt + APP.refreshCooldownMs : 0,
+      currentTime,
+    };
+  }
+
+  function recordAutoRefreshAttempt(timestamp) {
+    const currentTime = Number(timestamp || Date.now());
+    const timestamps = loadAutoRefreshHistory(currentTime);
+    timestamps.push(currentTime);
+    saveAutoRefreshHistory(timestamps);
+    return timestamps;
+  }
+
+  function formatAutoRefreshLimitMessage(windowState) {
+    const state = windowState || getAutoRefreshWindowState();
+    return `最近一小时内自动刷新已达 ${state.count}/${state.limit} 次，任务已暂停；请等待限流窗口恢复后人工处理`;
+  }
+
   // 跨页面自动化状态：记录当前阶段、已处理岗位标识、待发送岗位、固定列表地址和下一次运行时间。
   const RunState = {
     // 从 localStorage 读取运行状态，异常 JSON 直接视为空状态。
@@ -705,10 +799,13 @@
     },
   };
 
-  // 统一写调试事件；默认关闭，开启后才写内存/localStorage/控制台。
-  function logDebugEvent(type, data, level) {
+  // 统一写调试事件；普通事件默认关闭，关键刷新/访问受限事件可强制保留。
+  function logDebugEvent(type, data, level, options) {
     try {
-      if (!isDebugEnabled()) return;
+      if (!isDebugEnabled() && !(options && options.force)) return;
+      if (!isDebugEnabled() && options && options.force) {
+        runtime.debugEvents = loadStoredDebugEvents();
+      }
 
       const event = {
         time: nowIso(),
@@ -2684,6 +2781,14 @@
           </div>
 
           <div class="za-status" data-role="status">等待启动</div>
+          <div class="za-restricted-banner" data-role="restrictedBanner" hidden>
+            <div class="za-restricted-title">BOSS 访问受限</div>
+            <div class="za-restricted-message" data-role="restrictedBannerMessage">检测到 BOSS 403 访问限制页，自动沟通已暂停。</div>
+            <div class="za-inline">
+              <button type="button" data-action="exportDebugLogs">导出诊断日志</button>
+            </div>
+            <p class="za-hint" data-role="restrictedBannerLogStatus">日志 0 条</p>
+          </div>
 
           <section class="za-section" data-feature-section="greeting">
             <h3>打招呼配置</h3>
@@ -2784,10 +2889,10 @@
                 <label>最小间隔(秒)<input data-field="delayMin" type="number" min="1" step="1"></label>
                 <label>最大间隔(秒)<input data-field="delayMax" type="number" min="1" step="1"></label>
                 <label>等待上限(秒)<input data-field="waitTimeout" type="number" min="2" step="1"></label>
-                <label>聊天重试次数<input data-field="chatOpenRetries" type="number" min="0" step="1"></label>
                 <label>最大沟通数<input data-field="maxCount" type="number" min="0" step="1"></label>
-                <label>列表刷新上限<input data-field="maxListRefresh" type="number" min="0" step="1" title="当前列表耗尽后最多整页刷新次数，0 表示不限制"></label>
+                <label>一小时内刷新上限<input data-field="maxListRefresh" type="number" min="1" max="3" step="1" title="最近一小时内最多自动刷新3次，达到上限后暂停任务"></label>
               </div>
+              <p class="za-hint">列表耗尽后等待 60 秒再刷新；最近一小时累计达到 3 次后暂停任务。网络异常、页面加载失败或按钮点击失败时会立即暂停，不会自动重试。</p>
             </div>
           </section>
 
@@ -2884,7 +2989,7 @@
                 <button type="button" data-action="exportDebugLogs">导出日志</button>
                 <button type="button" class="za-danger-soft" data-action="clearDebugLogs">清除日志</button>
               </div>
-              <p class="za-hint" data-role="debugLogStatus">日志 0 条</p>
+              <p class="za-hint" data-role="debugLogStatus">日志 0 条；完整日志按需开启，刷新、暂停和限制页等关键事件会保留。</p>
             </div>
           </section>
 
@@ -2933,6 +3038,9 @@
         featurePanel: root.querySelector('[data-role="featurePanel"]'),
         featureButton: root.querySelector('[data-action="toggleFeaturePanel"]'),
         featureBlockList: root.querySelector('[data-role="featureBlockList"]'),
+        restrictedBanner: root.querySelector('[data-role="restrictedBanner"]'),
+        restrictedBannerMessage: root.querySelector('[data-role="restrictedBannerMessage"]'),
+        restrictedBannerLogStatus: root.querySelector('[data-role="restrictedBannerLogStatus"]'),
         fastReplyInput: root.querySelector('[data-field="fastReplyIndex"]'),
         fastReplyTrigger: root.querySelector('[data-action="toggleFastReplyPicker"]'),
         fastReplyTriggerText: root.querySelector('[data-role="fastReplyTriggerText"]'),
@@ -2972,11 +3080,12 @@
       this.refreshLatestVersion();
       this.setFeaturePanelOpen(config.featurePanelOpen);
       this.setPanelOpen(config.panelOpen);
+      this.setRestrictedPageMode(isBossAccessRestrictedPage());
       this.scheduleConfigReapply();
       this.refreshGreetedList();
       this.scheduleDailyDeliveryCountRefresh();
 
-      if (!config.fastReplies || !config.fastReplies.length) {
+      if (!isBossAccessRestrictedPage() && (!config.fastReplies || !config.fastReplies.length)) {
         setTimeout(() => FastReplyService.refresh(false), 500);
       }
     },
@@ -3376,14 +3485,42 @@
       if (!runtime.ui || !runtime.ui.root) return;
 
       const blocks = normalizeFeatureBlocks(config.featureBlocks);
+      const restrictedPage = isBossAccessRestrictedPage();
       runtime.ui.root.querySelectorAll('[data-feature-section]').forEach((section) => {
         const id = section.dataset.featureSection;
-        section.hidden = !blocks[id];
+        // 访问受限页必须保留调试日志板块，即使用户平时把它隐藏了。
+        section.hidden = !blocks[id] && !(restrictedPage && id === 'debugLog');
       });
 
       if (!blocks.companyFilter) {
         this.setBossActiveDropdownOpen(false);
       }
+    },
+
+    // 访问受限页只展示诊断信息和导出入口，并强制打开面板，避免用户找不到日志工具。
+    setRestrictedPageMode(restricted, message) {
+      if (!runtime.ui || !runtime.ui.root) return;
+
+      const enabled = Boolean(restricted);
+      runtime.ui.root.classList.toggle('za-restricted-page', enabled);
+      if (enabled) {
+        runtime.ui.root.classList.add('za-open');
+      } else if (!config.panelOpen) {
+        runtime.ui.root.classList.remove('za-open');
+      }
+
+      if (runtime.ui.restrictedBanner) {
+        runtime.ui.restrictedBanner.hidden = !enabled;
+      }
+      if (enabled && runtime.ui.restrictedBannerMessage) {
+        runtime.ui.restrictedBannerMessage.textContent = message || '检测到 BOSS 403 访问限制页，自动沟通已暂停。';
+      }
+
+      const debugSection = runtime.ui.root.querySelector('[data-feature-section="debugLog"]');
+      if (debugSection && enabled) debugSection.hidden = false;
+      const startButton = runtime.ui.root.querySelector('[data-action="start"]');
+      if (startButton) startButton.disabled = enabled;
+      this.renderDebugLogControls();
     },
 
     // 展开/收起面板并持久化到配置。
@@ -3512,7 +3649,10 @@
       }
       if (runtime.ui.debugLogStatus) {
         const count = loadStoredDebugEvents().length;
-        runtime.ui.debugLogStatus.textContent = `日志 ${count} 条`;
+        runtime.ui.debugLogStatus.textContent = `日志 ${count} 条；关键刷新、暂停和限制页事件会常驻`;
+        if (runtime.ui.restrictedBannerLogStatus) {
+          runtime.ui.restrictedBannerLogStatus.textContent = `当前可导出诊断日志：${count} 条`;
+        }
       }
     },
 
@@ -4262,6 +4402,23 @@
     // 手动点击“开始”后的入口：校验配置、初始化存储和索引，然后进入列表循环。
     async start() {
       if (runtime.automationLoopActive) return;
+      if (isBossAccessRestrictedPage()) {
+        UI.setRestrictedPageMode(true, '当前是 BOSS 访问限制页，已禁止重新启动自动沟通。');
+        UI.setStatus('当前是 BOSS 访问限制页，已禁止启动自动沟通；请先导出诊断日志。', 'error');
+        return;
+      }
+
+      const refreshWindow = getAutoRefreshWindowState();
+      if (refreshWindow.count >= refreshWindow.limit) {
+        const message = formatAutoRefreshLimitMessage(refreshWindow);
+        RunState.pause(message);
+        UI.setRunning(false);
+        UI.setStatus(message, 'error');
+        logDebugEvent('automation_start_blocked_refresh_limit', {
+          refreshWindow,
+        }, 'warn', { force: true });
+        return;
+      }
 
       UI.unlockStatus();
       UI.saveFormToConfig();
@@ -4319,6 +4476,7 @@
         listSnapshot: createJobListSnapshot(),
         chatOpenRetryCount: 0,
         listRefreshCount: 0,
+        pauseAfterRefresh: false,
         startedAt: nowIso(),
       });
 
@@ -4345,9 +4503,14 @@
       runtime.stopRequested = true;
       runtime.automationLoopActive = false;
       UI.unlockStatus();
-      RunState.pause(reason || '已暂停');
+      const pauseReason = reason || '已暂停';
+      const state = RunState.pause(pauseReason);
       UI.setRunning(false);
-      UI.setStatus(reason || '已暂停', 'warn');
+      UI.setStatus(pauseReason, 'warn');
+      logDebugEvent('automation_paused', {
+        reason: pauseReason,
+        runState: state,
+      }, 'warn', { force: true });
     },
 
     // 页面加载、pageshow 或路由切换时调用，根据 RunState 恢复 list/chat/returning 阶段。
@@ -4363,6 +4526,29 @@
         await ContactedIndex.ensureReady();
         state = RunState.load();
         if (!state || !state.active) return;
+
+        if (state.pauseAfterRefresh) {
+          const message = formatAutoRefreshLimitMessage(getAutoRefreshWindowState());
+          this.pause(message);
+          logDebugEvent('automation_paused_after_refresh_limit', {
+            reason,
+            runState: RunState.load(),
+            refreshWindow: getAutoRefreshWindowState(),
+          }, 'warn', { force: true });
+          return;
+        }
+
+        const refreshWindow = getAutoRefreshWindowState();
+        if (refreshWindow.count >= refreshWindow.limit) {
+          const message = formatAutoRefreshLimitMessage(refreshWindow);
+          this.pause(message);
+          logDebugEvent('automation_paused_refresh_limit', {
+            reason,
+            runState: RunState.load(),
+            refreshWindow,
+          }, 'warn', { force: true });
+          return;
+        }
 
         runtime.stopRequested = false;
         UI.setRunning(true);
@@ -4387,7 +4573,11 @@
         this.runListLoop(reason);
       } catch (error) {
         runtime.automationLoopActive = false;
-        this.fatal(error.message || String(error));
+        if (isAutomationInterventionError(error)) {
+          this.pause(formatAutomationPauseMessage(error, '页面恢复或网络操作异常'));
+        } else {
+          this.fatal(error.message || String(error));
+        }
       } finally {
         runtime.resumeInProgress = false;
       }
@@ -4406,7 +4596,10 @@
         await waitForElement('li.job-card-box', getWaitTimeout(), '岗位列表');
         // 每次进入/恢复列表循环都复核冻结的求职期望，不能只依赖启动时的 active 类。
         await ensureFrozenJobExpectationContext(RunState.load(), 'list-loop');
-        await JobRepository.waitForApiData(1800);
+        const apiReady = await JobRepository.waitForApiData(1800);
+        if (!apiReady) {
+          throw createPauseError('岗位列表数据加载失败，已暂停任务；请人工检查网络和页面后再继续');
+        }
         JobRepository.syncCards();
 
         while (!runtime.stopRequested) {
@@ -4424,6 +4617,8 @@
             // 当前虚拟列表扫完后可整页刷新续跑；达到刷新上限或关闭开关时才真正停止。
             const refreshed = await this.refreshListAfterExhausted();
             if (refreshed) return;
+            const latestState = RunState.load();
+            if (latestState && latestState.phase === 'paused') break;
             this.stop('没有更多符合条件的岗位');
             break;
           }
@@ -4442,7 +4637,11 @@
           }
         }
       } catch (error) {
-        this.fatal(error.message || String(error));
+        if (isAutomationInterventionError(error)) {
+          this.pause(formatAutomationPauseMessage(error, '列表页面或自动化操作异常'));
+        } else {
+          this.fatal(error.message || String(error));
+        }
       } finally {
         runtime.automationLoopActive = false;
         const state = RunState.load();
@@ -4454,12 +4653,18 @@
     async processNextCard(state) {
       let currentState = state || RunState.load() || {};
       if (!runtime.jobPool.length) {
-        await JobRepository.waitForApiData(1200);
+        const apiReady = await JobRepository.waitForApiData(1200);
+        if (!apiReady) {
+          throw createPauseError('岗位列表接口未加载完成，已暂停任务；请人工检查网络和页面后再继续');
+        }
       }
 
       if (currentState.scanPhase !== 'scanning_down') {
         UI.setStatus('正在向上恢复岗位列表顶部...', 'info');
-        await scanJobListToTop();
+        const reachedTop = await scanJobListToTop();
+        if (!reachedTop) {
+          throw createPauseError('岗位列表无法正常定位，已暂停任务；请人工检查页面后再继续');
+        }
         currentState = RunState.patch({
           scanPhase: 'scanning_down',
           scanNoProgressCount: 0,
@@ -4612,7 +4817,9 @@
       card.scrollIntoView({ block: 'center', inline: 'nearest' });
       const detailResourceStartedAt = typeof performance !== 'undefined' ? performance.now() : 0;
       // 先点岗位卡片让右侧详情刷新，再从详情接口/DOM 里补充岗位信息。
-      clickElement(card);
+      if (!clickElement(card)) {
+        throw createPauseError('岗位卡片点击失败，已暂停任务；请人工检查页面后再继续');
+      }
 
       const apiDetail = await JobRepository.waitForJobDetail(
         job,
@@ -4761,7 +4968,9 @@
 
       // 完整文档导航会把当前列表页放入 BFCache；先监听 pagehide，避免返回后旧超时器误停新流程。
       this.watchChatPageTransition(job);
-      clickElement(chatButton);
+      if (!clickElement(chatButton)) {
+        throw createPauseError('沟通按钮点击失败，已暂停任务；请人工检查页面后再继续');
+      }
       logDebugEvent('chat_button_clicked', {
         cursorIndex,
         job: summarizeJobForDebug(job),
@@ -4834,13 +5043,9 @@
           return;
         }
 
-        // 点击未触发导航时交给现有的聊天渲染/重新点击机制处理，不再直接 fatal 停机。
-        if (latestState && latestState.active && latestState.phase === 'chat' && latestState.pendingJob && isJobListRoute()) {
-          setTimeout(() => {
-            runtime.automationLoopActive = false;
-            this.continueFromChat('chat-transition-timeout');
-          }, 0);
-        }
+        // 点击后没有进入聊天页属于按钮点击或页面加载失败；停止，不再重新点击同一岗位。
+        runtime.automationLoopActive = false;
+        this.pause('点击沟通后未进入聊天页，可能是按钮点击或页面加载失败；已暂停任务，请人工处理');
       });
     },
 
@@ -4927,133 +5132,37 @@
         await this.completeReturnToList(RunState.load(), reason || 'chat');
       } catch (error) {
         runtime.automationLoopActive = false;
-        if (error && error.zhipinAutoPause) {
-          this.pause(error.message || '已暂停');
+        if (isAutomationInterventionError(error)) {
+          this.pause(formatAutomationPauseMessage(error, '聊天页面、网络或发送操作异常'));
         } else {
           this.fatal(error.message || String(error));
         }
       }
     },
 
-    // 发送时如果聊天输入框渲染超时，可返回列表重新点击同一岗位进行有限重试。
+    // 发送链路出现异常时只记录并暂停，避免重复打开聊天或重复点击同一岗位。
     async sendCurrentWithChatOpenRetries(pendingJob, initialState) {
-      const maxRetries = getChatOpenRetryLimit();
-      let attempts = Math.max(0, Number(initialState && initialState.chatOpenRetryCount || 0));
-
-      while (true) {
-        try {
-          return await GreetingService.sendCurrent(pendingJob);
-        } catch (error) {
-          logDebugEvent('send_current_error', {
-            message: error && error.message || String(error),
-            isChatRenderTimeout: isChatRenderTimeoutError(error),
-            attempts,
-            maxRetries,
-            pendingJob: summarizeJobForDebug(pendingJob),
-            runState: RunState.load(),
-            listState: getDebugListState(),
-          }, 'warn');
-
-          if (!isChatRenderTimeoutError(error) || attempts >= maxRetries) {
-            // 最后一次聊天超时时再尝试关闭软提醒；硬限制转暂停而不是 fatal。
-            const dialog = inspectBossPlatformDialog({ dismissSoft: true });
-            if (dialog && dialog.kind === 'hard_limit') {
-              throw createPauseError(formatBossDialogPauseMessage(dialog));
-            }
-            throw error;
-          }
-
-          // 聊天页偶发不渲染输入框时，回岗位列表重新点击同一个沟通按钮，而不是直接跳过该岗位。
-          attempts += 1;
-          const latestState = RunState.load() || initialState || {};
-          RunState.patch({ chatOpenRetryCount: attempts });
-          await this.retryOpenChatForPendingJob(latestState, pendingJob, attempts, maxRetries);
-        }
-      }
-    },
-
-    // 聊天页打不开时的重试：回到列表，重新定位原岗位卡片并再次点击沟通。
-    async retryOpenChatForPendingJob(state, pendingJob, attempt, maxRetries) {
-      UI.setStatus(`聊天界面渲染超时，正在重新点击沟通 ${attempt}/${maxRetries}`, 'warn');
-      logDebugEvent('chat_open_retry_start', {
-        attempt,
-        maxRetries,
-        pendingJob: summarizeJobForDebug(pendingJob),
-        runState: state,
-        listState: getDebugListState(),
-      }, 'warn');
-
-      await navigateToJobList(state);
-      await waitForVisibleJobList(Math.max(3000, getWaitTimeout() * 1000));
-      await ensureFrozenJobExpectationContext(state, 'chat-open-retry');
-      await restoreJobListPosition(state);
-      await JobRepository.waitForApiData(Math.min(1800, getWaitTimeout() * 1000));
-      const cards = JobRepository.syncCards();
-      const card = findJobCardForRetry(pendingJob, cards, Number(state && state.cursorIndex || 0));
-
-      if (!card) {
-        logDebugEvent('chat_open_retry_card_missing', {
-          attempt,
+      try {
+        return await GreetingService.sendCurrent(pendingJob);
+      } catch (error) {
+        logDebugEvent('send_current_error', {
+          message: error && error.message || String(error),
+          isChatRenderTimeout: isChatRenderTimeoutError(error),
+          automaticRetry: false,
           pendingJob: summarizeJobForDebug(pendingJob),
-          cursorIndex: Number(state && state.cursorIndex || 0),
-          visibleCards: cards.slice(0, 8).map((item) => summarizeDomInfoForDebug(extractCardInfo(item))),
+          runState: RunState.load(),
           listState: getDebugListState(),
-        }, 'warn');
-        throw new Error('聊天界面渲染 等待超时');
+        }, 'warn', { force: true });
+
+        const dialog = inspectBossPlatformDialog({ dismissSoft: true });
+        if (dialog && dialog.kind === 'hard_limit') {
+          throw createPauseError(formatBossDialogPauseMessage(dialog));
+        }
+        if (isChatRenderTimeoutError(error)) {
+          throw createPauseError('聊天界面加载失败，已暂停任务；请人工检查页面后再继续');
+        }
+        throw error;
       }
-
-      logDebugEvent('chat_open_retry_card_found', {
-        attempt,
-        pendingJob: summarizeJobForDebug(pendingJob),
-        domInfo: summarizeDomInfoForDebug(extractCardInfo(card)),
-      });
-
-      card.scrollIntoView({ block: 'center', inline: 'nearest' });
-      const detailResourceStartedAt = typeof performance !== 'undefined' ? performance.now() : 0;
-      clickElement(card);
-
-      const apiDetail = await JobRepository.waitForJobDetail(
-        pendingJob,
-        Math.min(8000, Math.max(4500, getWaitTimeout() * 1000)),
-        detailResourceStartedAt,
-        { includeHtml: true, forceApiFetch: true },
-      );
-      let refreshedJob = mergeJobInfo(pendingJob, apiDetail);
-      // 重试同样执行详情/按钮一致性校验，不能因为是第二次点击就复用可能过期的 DOM。
-      const detailReady = await waitForJobCommunicationDetail(refreshedJob, getWaitTimeout() * 1000);
-      const chatButton = detailReady.chatButton;
-      const buttonText = normalizeText(chatButton.innerText || chatButton.textContent || '');
-      refreshedJob = mergeJobInfo(refreshedJob, detailReady.detail);
-      logDebugEvent('chat_open_retry_button_found', {
-        attempt,
-        buttonText,
-        buttonHref: chatButton.getAttribute('href'),
-        buttonKa: chatButton.getAttribute('ka'),
-        detailJobName: detailReady.detail.jobName,
-        pendingJob: summarizeJobForDebug(pendingJob),
-      });
-
-      RunState.patch({
-        active: true,
-        phase: 'chat',
-        cursorIndex: Number(state && state.cursorIndex || 0),
-        pendingJob: flattenJob(refreshedJob),
-        pendingRawJob: refreshedJob.rawJob || pendingJob.rawJob || null,
-        pendingJobKey: state && state.pendingJobKey || getJobScanKey(refreshedJob),
-        chatButtonText: buttonText,
-        listUrl: state && state.listUrl || getRestorableListUrl(location.href) || location.href,
-        listFilterSignature: state && state.listFilterSignature || makeJobListFilterSignature(state && state.listUrl || location.href),
-        listSnapshot: createJobListSnapshot(),
-        chatOpenRetryCount: attempt,
-      });
-
-      clickElement(chatButton);
-      logDebugEvent('chat_open_retry_clicked', {
-        attempt,
-        refreshedJob: summarizeJobForDebug(refreshedJob),
-        chatButtonText: buttonText,
-        listUrl: state && state.listUrl || location.href,
-      });
     },
 
     // 发送完成后先尝试历史返回；只有筛选上下文完全一致才算成功，否则恢复固定的原列表 URL。
@@ -5193,22 +5302,70 @@
 
       const state = RunState.load() || {};
       const refreshCount = Math.max(0, Number(state.listRefreshCount || 0));
-      const maxRefresh = Math.max(0, Number(config.maxListRefresh || 0));
-      if (maxRefresh > 0 && refreshCount >= maxRefresh) {
-        UI.setStatus(`已达到列表刷新上限：${maxRefresh}`, 'warn');
-        logDebugEvent('list_exhausted_refresh_limit', { refreshCount, maxRefresh }, 'warn');
+      const windowState = getAutoRefreshWindowState();
+      const maxRefresh = windowState.limit;
+      const pageProblem = getVisibleJobListProblem();
+      if (pageProblem) {
+        const message = `检测到岗位列表页面异常：${pageProblem}，已暂停任务；请人工处理`;
+        this.pause(message);
+        logDebugEvent('list_exhausted_refresh_blocked_page_problem', {
+          message,
+          pageProblem,
+          runState: RunState.load(),
+          refreshWindow: windowState,
+        }, 'error', { force: true });
         return false;
       }
 
+      if (windowState.count >= maxRefresh) {
+        const message = formatAutoRefreshLimitMessage(windowState);
+        this.pause(message);
+        logDebugEvent('list_exhausted_refresh_limit', {
+          refreshCount,
+          refreshWindow: windowState,
+          runState: RunState.load(),
+        }, 'warn', { force: true });
+        return false;
+      }
+
+      const cooldownStartedAt = Date.now();
+      const nextRunAt = Math.max(
+        cooldownStartedAt + APP.refreshCooldownMs,
+        Number(windowState.nextAllowedAt || 0),
+      );
+      if (nextRunAt > Date.now()) {
+        const delaySeconds = Math.ceil((nextRunAt - Date.now()) / 1000);
+        RunState.patch({ nextRunAt, nextDelaySeconds: delaySeconds });
+        const completed = await waitWithStatusCountdown(
+          nextRunAt,
+          (remainingSeconds) => `列表已处理完，距离下一次自动刷新还需 ${remainingSeconds} 秒...`,
+        );
+        RunState.patch({ nextRunAt: null, nextDelaySeconds: null });
+        if (!completed) return false;
+      }
+
+      const refreshAt = Date.now();
+      const refreshTimestamps = recordAutoRefreshAttempt(refreshAt);
       const nextCount = refreshCount + 1;
-      const limitLabel = maxRefresh > 0 ? `${nextCount}/${maxRefresh}` : String(nextCount);
-      UI.setStatus(`当前列表已处理完，正在刷新页面继续（${limitLabel}）...`, 'warn');
+      const reachedLimit = refreshTimestamps.length >= maxRefresh;
+      const limitLabel = `${refreshTimestamps.length}/${maxRefresh}`;
       logDebugEvent('list_exhausted_refresh', {
         refreshCount: nextCount,
-        maxRefresh,
+        refreshWindowCount: refreshTimestamps.length,
+        refreshWindowLimit: maxRefresh,
+        refreshCooldownMs: APP.refreshCooldownMs,
+        refreshAt,
+        pauseAfterRefresh: reachedLimit,
         processedCount: Array.isArray(state.processedKeys) ? state.processedKeys.length : 0,
         listUrl: state.listUrl,
-      });
+      }, 'warn', { force: true });
+
+      UI.setStatus(
+        reachedLimit
+          ? `当前列表已处理完，正在执行第 ${limitLabel} 次刷新；刷新后将暂停任务...`
+          : `当前列表已处理完，等待结束后刷新页面继续（${limitLabel}）...`,
+        'warn',
+      );
 
       // 清空本轮扫描进度，保留筛选 URL / 求职期望 / sentCount；已沟通去重仍靠 ContactedIndex。
       RunState.patch({
@@ -5232,10 +5389,10 @@
         listSnapshot: createJobListSnapshot(),
         stopReason: '',
         pauseReason: '',
+        pauseAfterRefresh: reachedLimit,
       });
 
       runtime.stopRequested = false;
-      await sleep(600);
       location.reload();
       return true;
     },
@@ -5260,6 +5417,58 @@
       setTimeout(() => alert(`[${APP.name}] ${message}`), 0);
     },
   };
+
+  // 访问受限页只做诊断：自动暂停运行状态、保留页面信息，并把日志导出入口放到面板上。
+  function handleBossAccessRestrictedPage(reason) {
+    if (!runtime.ui || !isBossAccessRestrictedPage()) return;
+
+    const message = '检测到 BOSS 访问受限页，自动沟通已暂停；请先导出诊断日志。';
+    const firstVisit = runtime.lastRestrictedPageHref !== location.href;
+    if (firstVisit) {
+      runtime.lastRestrictedPageHref = location.href;
+      let autoEnabled = false;
+      try {
+        if (!isDebugEnabled()) {
+          localStorage.setItem(APP.debugEnabledKey, '1');
+          runtime.debugEvents = loadStoredDebugEvents();
+          autoEnabled = true;
+        }
+      } catch (_) {}
+
+      let urlInfo = {};
+      try {
+        const url = new URL(location.href);
+        urlInfo = {
+          code: url.searchParams.get('code') || '',
+          pathname: url.pathname,
+        };
+      } catch (_) {}
+
+      logDebugEvent('boss_access_restricted_page', {
+        reason,
+        href: location.href,
+        title: normalizeText(document.title),
+        pageText: summarizeLongText(document.body && (document.body.innerText || document.body.textContent) || ''),
+        urlInfo,
+        runState: RunState.load(),
+        autoEnabledDebugLogging: autoEnabled,
+      }, 'error');
+    }
+
+    const state = RunState.load();
+    if (state && state.active) {
+      Automation.pause(message);
+      logDebugEvent('automation_paused_access_restricted', {
+        reason,
+        runState: RunState.load(),
+      }, 'warn');
+    } else {
+      UI.setRunning(false);
+    }
+
+    UI.setRestrictedPageMode(true, message);
+    UI.setStatus(message, 'error');
+  }
 
   // 导出器：JSON/Excel 都在前端生成，下载时强制补扩展名，避免保存成无后缀 blob。
   const Exporter = {
@@ -5397,6 +5606,10 @@
 
       const outputFileName = ensureFileExtension(`zhipin-debug-logs-${dateFileName()}`, 'json');
       const saveHandlePromise = requestSaveFileHandle(outputFileName, 'json');
+      const refreshHistory = loadAutoRefreshHistory().map((timestamp) => ({
+        timestamp,
+        time: new Date(timestamp).toISOString(),
+      }));
       const payload = {
         app: APP.name,
         version: APP.version,
@@ -5404,6 +5617,7 @@
         href: location.href,
         debugEnabled: isDebugEnabled(),
         eventCount: events.length,
+        refreshHistory,
         events,
       };
 
@@ -6791,6 +7005,37 @@
     return error;
   }
 
+  // 网络、页面渲染或点击链路异常都必须停下来交给人工确认，不能被当作普通岗位结束继续刷新。
+  function isAutomationInterventionError(error) {
+    if (error && error.zhipinAutoPause) return true;
+    const message = normalizeText(error && error.message || error || '');
+    if (!message) return false;
+    return /Failed to fetch|NetworkError|网络(?:异常|错误|断开)|请求失败|HTTP\s*\d{3}|加载(?:失败|超时)|等待超时|未加载完成|未就绪|找不到|未找到|无法恢复|没有可同步|按钮|点击|跳转|列表(?:接口|页面)?|岗位详情|聊天界面|消息发送确认|求职期望/i.test(message);
+  }
+
+  function formatAutomationPauseMessage(error, fallback) {
+    const message = normalizeText(error && error.message || error || '');
+    if (error && error.zhipinAutoPause && message) return message;
+    const shortMessage = message.length > 100 ? `${message.slice(0, 100)}...` : message;
+    return `${fallback || '自动化操作异常'}，已暂停任务${shortMessage ? `：${shortMessage}` : '；请人工处理后再继续'}`;
+  }
+
+  // 只在等待列表进展超时的低频路径扫描页面错误文案，避免把普通“列表到底”误判成故障。
+  function getVisibleJobListProblem() {
+    if (typeof navigator !== 'undefined' && navigator.onLine === false) return '浏览器当前处于离线状态';
+    let text = '';
+    try {
+      const pageCopy = document.body && document.body.cloneNode(true);
+      const ownUi = pageCopy && pageCopy.querySelector('#zhipin-auto-greeting-root');
+      if (ownUi) ownUi.remove();
+      text = normalizeText(pageCopy && (pageCopy.innerText || pageCopy.textContent) || '');
+    } catch (_) {
+      text = normalizeText(document.body && (document.body.innerText || document.body.textContent) || '');
+    }
+    const match = text.match(/网络异常|网络错误|请求失败|加载失败|系统繁忙|服务异常|稍后再试|页面出错/);
+    return match ? match[0] : '';
+  }
+
   // 识别 BOSS 沟通相关平台弹窗（温馨提示 / 次数用尽等），排除脚本自己的确认框。
   function findBossPlatformDialog() {
     const selectorRoots = Array.from(document.querySelectorAll([
@@ -7370,12 +7615,14 @@
     let job = entry.job;
     let ready = getJobCommunicationDetailReady(job);
     let clicked = false;
-    if (!ready) {
-      // 当前详情仍属于旧列表时主动点击目标卡片，并用接口数据补齐强身份后再校验按钮。
-      clicked = true;
-      entry.card.scrollIntoView({ block: 'center', inline: 'nearest' });
-      const detailResourceStartedAt = typeof performance !== 'undefined' ? performance.now() : 0;
-      clickElement(entry.card);
+      if (!ready) {
+        // 当前详情仍属于旧列表时主动点击目标卡片，并用接口数据补齐强身份后再校验按钮。
+        clicked = true;
+        entry.card.scrollIntoView({ block: 'center', inline: 'nearest' });
+        const detailResourceStartedAt = typeof performance !== 'undefined' ? performance.now() : 0;
+        if (!clickElement(entry.card)) {
+          throw createPauseError('恢复列表时岗位卡片点击失败，已暂停任务；请人工检查页面后再继续');
+        }
 
       const apiDetail = await JobRepository.waitForJobDetail(
         job,
@@ -7467,7 +7714,9 @@
     }, 'warn');
 
     target.scrollIntoView({ block: 'nearest', inline: 'nearest' });
-    clickElement(target);
+    if (!clickElement(target)) {
+      throw createPauseError('恢复求职期望时按钮点击失败，已暂停任务；请人工检查页面后再继续');
+    }
     // 点击恢复后只接受本次点击之后完成、且参数属于目标期望的列表请求；800ms 用于吸收并发晚到响应。
     const ready = await waitForJobExpectationReady(expected, {
       requiredCompletedAt: restoreStartedAt,
@@ -7684,35 +7933,6 @@
     ].join(','))).some((element) => !isOwnUiElement(element) && isVisible(element));
   }
 
-  // 重试打开聊天时重新定位原岗位卡片，优先按岗位匹配，最后用旧游标兜底。
-  function findJobCardForRetry(job, cards, fallbackIndex) {
-    const candidates = cards && cards.length ? cards : getJobCards();
-    for (const card of candidates) {
-      if (isRetryCardMatch(card, job)) return card;
-    }
-
-    const fallback = candidates[Math.max(0, Number(fallbackIndex || 0))];
-    return fallback && isRetryCardMatch(fallback, job) ? fallback : null;
-  }
-
-  // 判断重试时某张卡片是否像 pendingJob。
-  function isRetryCardMatch(card, job) {
-    if (!card || !job) return false;
-
-    const domInfo = extractCardInfo(card);
-    const match = JobRepository.cardLooksLikeJob(domInfo, job);
-    if (match.comparable) return match.matched;
-
-    const text = domInfo.text || normalizeText(card.innerText || card.textContent || '');
-    const jobName = normalizeText(job.jobName);
-    const company = normalizeText(job.company);
-    const bossName = normalizeText(job.bossName);
-
-    if (jobName && company) return text.includes(jobName) && text.includes(company);
-    if (jobName && bossName) return text.includes(jobName) && text.includes(bossName);
-    return Boolean(jobName && text.includes(jobName));
-  }
-
   // 记录返回前列表快照，返回后用于判断列表是否刷新或上下文是否变化。
   function createJobListSnapshot() {
     const cards = getJobCards();
@@ -7822,11 +8042,14 @@
     const cards = entries.map((entry) => entry.card);
     const lastCard = cards[cards.length - 1];
     const scroller = findScrollParent(lastCard) || document.scrollingElement || document.documentElement;
-    if (!scroller) return false;
+    if (!scroller) {
+      throw createPauseError('岗位列表滚动容器加载失败，已暂停任务；请人工检查页面后再继续');
+    }
 
     const knownKeys = previousKeys instanceof Set
       ? previousKeys
       : new Set(Array.from(previousKeys || []).filter(Boolean));
+    const scrollStartedAt = Date.now();
     const beforeTop = Number(scroller.scrollTop || 0);
     const beforeSerial = Number(runtime.jobListResponseSerial || 0);
     const beforeBatchKey = runtime.jobListLastBatchKey || '';
@@ -7856,7 +8079,14 @@
       });
       return true;
     } catch (_) {
-      return hasProgress();
+      const progressed = hasProgress();
+      const latestRequestStartedAt = Number(runtime.latestJobListRequest && runtime.latestJobListRequest.capturedAt || 0);
+      const requestStillPending = latestRequestStartedAt >= scrollStartedAt && Number(runtime.jobListResponseSerial || 0) <= beforeSerial;
+      const pageProblem = getVisibleJobListProblem();
+      if (!progressed && (requestStillPending || pageProblem)) {
+        throw createPauseError(`岗位列表加载失败，已暂停任务：${pageProblem || '列表请求未完成'}`);
+      }
+      return progressed;
     }
   }
 
@@ -8085,38 +8315,43 @@
 
   // 模拟用户点击，按真实坐标派发 pointer/mouse/click 事件。
   function clickElement(element) {
-    if (!element) return;
+    if (!element || !isVisible(element)) return false;
 
-    const rect = element.getBoundingClientRect();
-    const clientX = rect.left + Math.min(Math.max(rect.width / 2, 4), Math.max(rect.width - 4, 4));
-    const clientY = rect.top + Math.min(Math.max(rect.height / 2, 4), Math.max(rect.height - 4, 4));
-    const target = document.elementFromPoint(clientX, clientY) || element;
-    const mouseInit = {
-      bubbles: true,
-      cancelable: true,
-      composed: true,
-      view: pageWindow,
-      clientX,
-      clientY,
-      screenX: clientX,
-      screenY: clientY,
-      button: 0,
-      buttons: 1,
-    };
+    try {
+      const rect = element.getBoundingClientRect();
+      const clientX = rect.left + Math.min(Math.max(rect.width / 2, 4), Math.max(rect.width - 4, 4));
+      const clientY = rect.top + Math.min(Math.max(rect.height / 2, 4), Math.max(rect.height - 4, 4));
+      const target = document.elementFromPoint(clientX, clientY) || element;
+      const mouseInit = {
+        bubbles: true,
+        cancelable: true,
+        composed: true,
+        view: pageWindow,
+        clientX,
+        clientY,
+        screenX: clientX,
+        screenY: clientY,
+        button: 0,
+        buttons: 1,
+      };
 
-    // BOSS 的部分列表项依赖真实坐标下的 pointer/mouse 事件，单纯 element.click() 不会触发。
-    dispatchPointer(target, 'pointerover', mouseInit);
-    target.dispatchEvent(new MouseEvent('mouseover', mouseInit));
-    dispatchPointer(target, 'pointerdown', mouseInit);
-    target.dispatchEvent(new MouseEvent('mousedown', mouseInit));
-    dispatchPointer(target, 'pointerup', Object.assign({}, mouseInit, { buttons: 0 }));
-    target.dispatchEvent(new MouseEvent('mouseup', Object.assign({}, mouseInit, { buttons: 0 })));
-    target.dispatchEvent(new MouseEvent('click', Object.assign({}, mouseInit, { buttons: 0 })));
+      // BOSS 的部分列表项依赖真实坐标下的 pointer/mouse 事件，单纯 element.click() 不会触发。
+      dispatchPointer(target, 'pointerover', mouseInit);
+      target.dispatchEvent(new MouseEvent('mouseover', mouseInit));
+      dispatchPointer(target, 'pointerdown', mouseInit);
+      target.dispatchEvent(new MouseEvent('mousedown', mouseInit));
+      dispatchPointer(target, 'pointerup', Object.assign({}, mouseInit, { buttons: 0 }));
+      target.dispatchEvent(new MouseEvent('mouseup', Object.assign({}, mouseInit, { buttons: 0 })));
+      target.dispatchEvent(new MouseEvent('click', Object.assign({}, mouseInit, { buttons: 0 })));
 
-    if (target !== element) {
-      try {
-        element.click();
-      } catch (_) {}
+      if (target !== element) {
+        try {
+          element.click();
+        } catch (_) {}
+      }
+      return true;
+    } catch (error) {
+      throw createPauseError(`按钮点击失败，已暂停任务：${normalizeText(error && error.message || error) || '事件派发异常'}`);
     }
   }
 
@@ -8477,8 +8712,8 @@
     if (!Number.isFinite(wait) || wait < 2) return '等待上限不能小于 2 秒';
 
     const maxListRefresh = Number(config.maxListRefresh);
-    if (!Number.isFinite(maxListRefresh) || maxListRefresh < 0) {
-      return '列表刷新上限不能小于 0';
+    if (!Number.isFinite(maxListRefresh) || maxListRefresh < 1 || maxListRefresh > APP.maxAutoRefreshesPerHour) {
+      return `一小时内自动刷新上限必须是 1-${APP.maxAutoRefreshesPerHour} 次`;
     }
 
     const salaryMin = Number(config.salaryMin);
@@ -8511,11 +8746,6 @@
   // 列表/详情等待上限，配置单位是秒，这里转换为毫秒前做最小值保护。
   function getWaitTimeout() {
     return Math.max(2, Number(config.waitTimeout || DEFAULT_CONFIG.waitTimeout));
-  }
-
-  // 聊天页打开重试次数，负数或异常值按 0 处理。
-  function getChatOpenRetryLimit() {
-    return Math.max(0, Math.floor(Number(config.chatOpenRetries ?? DEFAULT_CONFIG.chatOpenRetries) || 0));
   }
 
   // 聊天页等待时间比列表更长，给路由和会话渲染留余量。
@@ -9584,6 +9814,31 @@
         border-color: #fecdca;
         color: #b42318;
       }
+      #zhipin-auto-greeting-root .za-restricted-banner {
+        flex: 0 0 auto;
+        margin: 12px 14px 0;
+        padding: 12px;
+        border: 1px solid #fecdca;
+        border-radius: 8px;
+        background: #fff7f6;
+        color: #7a271a;
+      }
+      #zhipin-auto-greeting-root .za-restricted-title {
+        font-size: 14px;
+        font-weight: 700;
+      }
+      #zhipin-auto-greeting-root .za-restricted-message {
+        margin-top: 5px;
+        line-height: 1.5;
+        word-break: break-word;
+      }
+      #zhipin-auto-greeting-root .za-restricted-banner .za-inline {
+        margin-top: 10px;
+      }
+      #zhipin-auto-greeting-root .za-restricted-banner .za-hint {
+        margin-bottom: 0;
+        color: #912018;
+      }
       #zhipin-auto-greeting-root .za-section {
         padding: 16px 14px 0;
       }
@@ -10274,6 +10529,8 @@
     const wasMounted = Boolean(runtime.ui);
     const allowed = syncAllowedPageUi();
     // 恢复流程内部会按页面阶段等待对应 DOM，无需在 pageshow 后再盲等固定时间。
-    if (wasMounted && allowed && isAllowedDisplayPage()) Automation.resumeIfNeeded('pageshow');
+    if (wasMounted && allowed && isAllowedDisplayPage() && !isBossAccessRestrictedPage()) {
+      Automation.resumeIfNeeded('pageshow');
+    }
   });
 })();

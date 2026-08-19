@@ -1,11 +1,12 @@
 // ==UserScript==
 // @name         BOSS直聘自动沟通助手
 // @namespace    local.codex.zhipin
-// @version      0.1.13
+// @version      0.1.14
 // @description  在 BOSS 直聘搜索结果页自动选择岗位、发送常用语或自定义问候语，并记录岗位数据。
 // @match        https://www.zhipin.com/web/geek/jobs*
 // @match        https://www.zhipin.com/web/geek/chat*
 // @match        https://www.zhipin.com/web/passport/zp/403.html*
+// @match        https://www.zhipin.com/*
 // @run-at       document-start
 // @grant        unsafeWindow
 // @grant        GM_xmlhttpRequest
@@ -17,10 +18,10 @@
 /*
  * 项目说明：
  * - 这是运行在 Tampermonkey / 篡改猴中的 BOSS 直聘自动打招呼脚本。
- * - 面板在岗位列表页 `/web/geek/jobs` 的全部子路由和聊天页 `/web/geek/chat` 显示。
+ * - 面板在岗位列表页 `/web/geek/jobs`、聊天页 `/web/geek/chat` 和 BOSS 异常页面显示。
  * - 主流程：岗位列表选择岗位 -> 点击沟通按钮 -> 进入聊天页 -> 发送常用语或自定义文本 -> 返回岗位列表继续。
  * - 支持随机时间间隔、聊天/列表等待上限、已沟通跳过、岗位沟通记录导出与清理。
- * - 列表耗尽后可自动刷新页面续跑；沟通次数提醒弹窗会自动点击确定，硬限制则暂停。
+ * - 列表耗尽后可自动刷新页面，但刷新完成和意外重载都要人工确认；沟通次数提醒弹窗会自动点击确定，硬限制则暂停。
  * - 岗位记录存储在浏览器 IndexedDB，运行状态存储在 localStorage，用于跨页面跳转后恢复自动化。
  *
  * 维护定位：
@@ -39,7 +40,7 @@
   // 全局常量：集中维护脚本版本、存储 key、BOSS 接口特征和默认问候语。
   const APP = {
     name: 'BOSS自动沟通',
-    version: '0.1.13',
+    version: '0.1.14',
     githubVersionUrl: 'https://raw.githubusercontent.com/agarcabin/boss-auto-greeting/main/zhipin-auto-greeting.user.js',
     dbName: 'ZhipinAutoGreetingDB',
     dbVersion: 1,
@@ -53,6 +54,7 @@
     refreshCooldownMs: 60 * 1000,
     refreshWindowMs: 60 * 60 * 1000,
     maxAutoRefreshesPerHour: 3,
+    navigationIntentMaxAgeMs: 2 * 60 * 1000,
     jobListApiPattern: /\/wapi\/zpgeek\/(?:search\/joblist|pc\/(?:recommend|search)\/job\/list)\.json/i,
     jobDetailApiPattern: /\/wapi\/zpgeek\/job\/detail\.json/i,
     fastReplyUrl: '/wapi/zpchat/fastReply/userFastReplyList/get',
@@ -197,6 +199,7 @@
     latestVersion: '',
     latestVersionRequest: null,
     lastRestrictedPageHref: '',
+    lastAutomationGuardKey: '',
   };
 
   let config = loadConfig();
@@ -212,20 +215,23 @@
   function bootWhenReady() {
     if (runtime.ui) {
       setUiDisplayEnabled(isAllowedDisplayPage());
-      const restrictedPage = isBossAccessRestrictedPage();
-      UI.setRestrictedPageMode(restrictedPage);
-      if (restrictedPage) handleBossAccessRestrictedPage('route');
+      const guardInfo = getBossAutomationGuardInfo();
+      UI.setAutomationGuardMode(Boolean(guardInfo), guardInfo);
+      if (guardInfo) {
+        handleAutomationGuardPage('route', guardInfo);
+      }
       return;
     }
     if (!isAllowedDisplayPage()) return;
 
     const mount = () => {
       if (runtime.ui || !document.body || !isAllowedDisplayPage()) return;
+      const guardInfo = getBossAutomationGuardInfo();
       Database.open().catch((error) => console.warn('[ZhipinAuto] IndexedDB 初始化失败', error));
       UI.mount();
       setUiDisplayEnabled(true);
-      if (isBossAccessRestrictedPage()) {
-        handleBossAccessRestrictedPage('boot');
+      if (guardInfo) {
+        handleAutomationGuardPage('boot', guardInfo);
       } else {
         Automation.resumeIfNeeded('boot');
       }
@@ -488,11 +494,106 @@
       const url = new URL(href || location.href, location.href);
       if (url.origin !== 'https://www.zhipin.com') return false;
       const pathname = url.pathname.replace(/\/+$/, '');
-      if (isBossAccessRestrictedUrl(url.href)) return true;
+      if (getBossAutomationGuardInfo(url.href)) return true;
       if (pathname === '/web/geek/chat') return true;
       return isJobListUrl(url.href);
     } catch (_) {
       return false;
+    }
+  }
+
+  // 读取跨页面状态时不依赖 RunState，避免 document-start 阶段 route 记录触发 const TDZ。
+  function loadPersistedAutomationStateForGuard() {
+    try {
+      return JSON.parse(localStorage.getItem(APP.runKey) || 'null');
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function hasPendingAutomationRun() {
+    const state = loadPersistedAutomationStateForGuard();
+    return Boolean(state && (state.active || state.manualResumeRequired));
+  }
+
+  // 只读取页面可见文本并移除脚本自己的面板，避免把“暂停/导出日志”等文案误判为 BOSS 异常页。
+  function getBossPageTextWithoutOwnUi() {
+    try {
+      const pageCopy = document.body && document.body.cloneNode(true);
+      const ownUi = pageCopy && pageCopy.querySelector('#zhipin-auto-greeting-root');
+      if (ownUi) ownUi.remove();
+      return normalizeText(pageCopy && (pageCopy.innerText || pageCopy.textContent) || '');
+    } catch (_) {
+      return normalizeText(document.body && (document.body.innerText || document.body.textContent) || '');
+    }
+  }
+
+  // 总拦截 BOSS 登录、验证、风控和错误页面；命中后只允许人工处理，不进入自动化流程。
+  function getBossAutomationGuardInfo(href) {
+    try {
+      const url = new URL(href || location.href, location.href);
+      if (url.origin !== 'https://www.zhipin.com') return null;
+      const pathname = url.pathname.replace(/\/+$/, '') || '/';
+
+      if (isBossAccessRestrictedUrl(url.href)) {
+        return {
+          kind: 'access_restricted',
+          title: 'BOSS 访问受限',
+          message: '检测到 BOSS 访问限制页，自动沟通已暂停；请先人工确认账号和页面恢复情况。',
+        };
+      }
+
+      if (/^\/web\/passport\//.test(pathname)) {
+        return {
+          kind: 'login_required',
+          title: '需要人工登录',
+          message: '检测到 BOSS 账号登录页面，自动沟通已暂停；请人工完成登录后再继续。',
+        };
+      }
+
+      const pageText = getBossPageTextWithoutOwnUi();
+      const rules = [
+        {
+          kind: 'login_required',
+          title: '需要人工登录',
+          pattern: /登录已失效|登录过期|请先登录|请登录后|重新登录|扫码登录|密码登录/,
+          message: '检测到 BOSS 登录状态异常，自动沟通已暂停；请人工完成登录后再继续。',
+        },
+        {
+          kind: 'security_verification',
+          title: '需要人工验证',
+          pattern: /验证码|安全验证|人机验证|滑动验证|验证身份|异常登录|安全检查/,
+          message: '检测到 BOSS 安全验证页面，自动沟通已暂停；请人工完成验证后再继续。',
+        },
+        {
+          kind: 'account_risk',
+          title: '账号风险提示',
+          pattern: /账号(?:存在)?异常|账户(?:存在)?异常|异常行为|风险控制|风险提示|访问受限|暂时无法访问/,
+          message: '检测到 BOSS 账号或访问风险提示，自动沟通已暂停；请人工确认页面后再继续。',
+        },
+        {
+          kind: 'page_error',
+          title: '页面或网络异常',
+          pattern: /网络异常|网络错误|请求失败|加载失败|系统繁忙|服务异常|页面出错|稍后再试/,
+          message: '检测到 BOSS 页面或网络异常，自动沟通已暂停；请人工确认页面恢复后再继续。',
+        },
+      ];
+
+      const matchedRule = rules.find((rule) => rule.pattern.test(pageText));
+      if (matchedRule) return matchedRule;
+
+      // 任务进行中却落在未识别的 BOSS 页面时也拦截，防止脚本把未知页面当成列表继续操作。
+      const knownRoute = isJobListUrl(url.href) || pathname === '/web/geek/chat';
+      if (hasPendingAutomationRun() && /^\/web\//.test(pathname) && !knownRoute) {
+        return {
+          kind: 'unknown_route',
+          title: '未识别的 BOSS 页面',
+          message: '自动化任务进入了未识别的 BOSS 页面，已暂停任务；请人工确认当前页面后再继续。',
+        };
+      }
+      return null;
+    } catch (_) {
+      return null;
     }
   }
 
@@ -748,6 +849,33 @@
     return `最近一小时内自动刷新已达 ${state.count}/${state.limit} 次，任务已暂停；请等待限流窗口恢复后人工处理`;
   }
 
+  // 跨完整文档导航前记录意图；聊天跳转可自动恢复，列表整页刷新必须等待人工确认。
+  function createExpectedNavigation(kind, target) {
+    return {
+      kind: kind || '',
+      target: target || '',
+      createdAt: Date.now(),
+      sourceUrl: location.href,
+    };
+  }
+
+  function isExpectedNavigationCurrent(expectedNavigation) {
+    if (!expectedNavigation || !expectedNavigation.target) return false;
+    const createdAt = Number(expectedNavigation.createdAt || 0);
+    if (createdAt && Date.now() - createdAt > APP.navigationIntentMaxAgeMs) return false;
+    if (expectedNavigation.target === 'chat') return isChatPage();
+    if (expectedNavigation.target === 'list') return isJobListRoute();
+    return false;
+  }
+
+  function getExpectedNavigationLabel(expectedNavigation) {
+    if (!expectedNavigation) return '';
+    if (expectedNavigation.kind === 'list_refresh') return '列表刷新';
+    if (expectedNavigation.kind === 'chat') return '进入聊天页';
+    if (expectedNavigation.kind === 'return') return '返回岗位列表';
+    return '页面跳转';
+  }
+
   // 跨页面自动化状态：记录当前阶段、已处理岗位标识、待发送岗位、固定列表地址和下一次运行时间。
   const RunState = {
     // 从 localStorage 读取运行状态，异常 JSON 直接视为空状态。
@@ -779,17 +907,30 @@
         nextRunAt: null,
         nextDelaySeconds: null,
         stopReason: reason || '已停止',
+        expectedNavigation: null,
+        manualResumeRequired: false,
+        manualResumePhase: '',
+        guardKind: '',
       });
       return state;
     },
     // 暂停自动化但保留现场，给用户确认后可以重新启动。
-    pause(reason) {
+    pause(reason, options) {
+      const previous = this.load() || {};
+      const settings = options || {};
+      const manualResumeRequired = Boolean(settings.manualResumeRequired);
       const state = this.save({
         active: false,
         phase: 'paused',
         nextRunAt: null,
         nextDelaySeconds: null,
         pauseReason: reason || '已暂停',
+        expectedNavigation: null,
+        manualResumeRequired,
+        manualResumePhase: manualResumeRequired
+          ? settings.resumePhase || previous.phase || 'list'
+          : '',
+        guardKind: manualResumeRequired ? settings.guardKind || '' : '',
       });
       return state;
     },
@@ -2781,10 +2922,20 @@
           </div>
 
           <div class="za-status" data-role="status">等待启动</div>
+          <div class="za-guard-panel" data-role="guardPanel" aria-live="polite">
+            <div class="za-guard-grid">
+              <div><span>任务状态</span><strong data-role="guardRunState">待启动</strong></div>
+              <div><span>本轮沟通</span><strong data-role="guardSentCount">0</strong></div>
+              <div><span>本小时刷新</span><strong data-role="guardRefreshCount">0/3</strong></div>
+              <div><span>下次刷新</span><strong data-role="guardNextRefresh">未安排</strong></div>
+            </div>
+            <div class="za-guard-current" data-role="guardCurrentStatus">当前状态：等待启动</div>
+          </div>
           <div class="za-restricted-banner" data-role="restrictedBanner" hidden>
-            <div class="za-restricted-title">BOSS 访问受限</div>
+            <div class="za-restricted-title" data-role="restrictedBannerTitle">自动化已暂停</div>
             <div class="za-restricted-message" data-role="restrictedBannerMessage">检测到 BOSS 403 访问限制页，自动沟通已暂停。</div>
             <div class="za-inline">
+              <button type="button" data-action="resumeAfterGuard" hidden>人工确认后继续</button>
               <button type="button" data-action="exportDebugLogs">导出诊断日志</button>
             </div>
             <p class="za-hint" data-role="restrictedBannerLogStatus">日志 0 条</p>
@@ -3035,12 +3186,20 @@
         dailyDeliveryCount: root.querySelector('[data-role="dailyDeliveryCount"]'),
         dailyDeliveryCountValue: root.querySelector('[data-role="dailyDeliveryCountValue"]'),
         status: root.querySelector('[data-role="status"]'),
+        guardPanel: root.querySelector('[data-role="guardPanel"]'),
+        guardRunState: root.querySelector('[data-role="guardRunState"]'),
+        guardSentCount: root.querySelector('[data-role="guardSentCount"]'),
+        guardRefreshCount: root.querySelector('[data-role="guardRefreshCount"]'),
+        guardNextRefresh: root.querySelector('[data-role="guardNextRefresh"]'),
+        guardCurrentStatus: root.querySelector('[data-role="guardCurrentStatus"]'),
         featurePanel: root.querySelector('[data-role="featurePanel"]'),
         featureButton: root.querySelector('[data-action="toggleFeaturePanel"]'),
         featureBlockList: root.querySelector('[data-role="featureBlockList"]'),
         restrictedBanner: root.querySelector('[data-role="restrictedBanner"]'),
+        restrictedBannerTitle: root.querySelector('[data-role="restrictedBannerTitle"]'),
         restrictedBannerMessage: root.querySelector('[data-role="restrictedBannerMessage"]'),
         restrictedBannerLogStatus: root.querySelector('[data-role="restrictedBannerLogStatus"]'),
+        restrictedBannerResume: root.querySelector('[data-action="resumeAfterGuard"]'),
         fastReplyInput: root.querySelector('[data-field="fastReplyIndex"]'),
         fastReplyTrigger: root.querySelector('[data-action="toggleFastReplyPicker"]'),
         fastReplyTriggerText: root.querySelector('[data-role="fastReplyTriggerText"]'),
@@ -3080,12 +3239,14 @@
       this.refreshLatestVersion();
       this.setFeaturePanelOpen(config.featurePanelOpen);
       this.setPanelOpen(config.panelOpen);
-      this.setRestrictedPageMode(isBossAccessRestrictedPage());
+      const guardInfo = getBossAutomationGuardInfo();
+      this.setAutomationGuardMode(Boolean(guardInfo), guardInfo);
       this.scheduleConfigReapply();
       this.refreshGreetedList();
       this.scheduleDailyDeliveryCountRefresh();
+      this.scheduleGuardPanelRefresh();
 
-      if (!isBossAccessRestrictedPage() && (!config.fastReplies || !config.fastReplies.length)) {
+      if (!getBossAutomationGuardInfo() && (!config.fastReplies || !config.fastReplies.length)) {
         setTimeout(() => FastReplyService.refresh(false), 500);
       }
     },
@@ -3161,6 +3322,10 @@
         }
         if (action === 'closeFastReplyPicker') {
           this.setFastReplyPickerOpen(false);
+          return;
+        }
+        if (action === 'resumeAfterGuard') {
+          Automation.resumeAfterGuard();
           return;
         }
         if (action === 'selectFastReply') {
@@ -3485,11 +3650,11 @@
       if (!runtime.ui || !runtime.ui.root) return;
 
       const blocks = normalizeFeatureBlocks(config.featureBlocks);
-      const restrictedPage = isBossAccessRestrictedPage();
+      const guardedPage = Boolean(getBossAutomationGuardInfo());
       runtime.ui.root.querySelectorAll('[data-feature-section]').forEach((section) => {
         const id = section.dataset.featureSection;
-        // 访问受限页必须保留调试日志板块，即使用户平时把它隐藏了。
-        section.hidden = !blocks[id] && !(restrictedPage && id === 'debugLog');
+        // 异常页面必须保留调试日志板块，即使用户平时把它隐藏了。
+        section.hidden = !blocks[id] && !(guardedPage && id === 'debugLog');
       });
 
       if (!blocks.companyFilter) {
@@ -3497,30 +3662,65 @@
       }
     },
 
-    // 访问受限页只展示诊断信息和导出入口，并强制打开面板，避免用户找不到日志工具。
+    // 兼容旧调用点；新的异常页和人工确认流程统一走 setAutomationGuardMode。
     setRestrictedPageMode(restricted, message) {
+      this.setAutomationGuardMode(Boolean(restricted), restricted
+        ? {
+          kind: 'access_restricted',
+          title: 'BOSS 访问受限',
+          message: message || '检测到 BOSS 403 访问限制页，自动沟通已暂停。',
+        }
+        : null);
+    },
+
+    // 异常页拦截、意外重载和列表刷新后的人工确认共用一套可视提示。
+    setAutomationGuardMode(blocked, info) {
       if (!runtime.ui || !runtime.ui.root) return;
 
-      const enabled = Boolean(restricted);
-      runtime.ui.root.classList.toggle('za-restricted-page', enabled);
-      if (enabled) {
+      const state = RunState.load() || {};
+      const guardInfo = info || (state.manualResumeRequired
+        ? {
+          kind: state.guardKind || 'manual_resume',
+          title: '等待人工确认',
+          message: state.pauseReason || '任务已暂停，请确认页面状态后继续。',
+        }
+        : null);
+      const enabled = Boolean(blocked);
+      const visible = enabled || Boolean(state.manualResumeRequired);
+      const accessRestricted = Boolean(guardInfo && guardInfo.kind === 'access_restricted');
+
+      runtime.ui.root.classList.toggle('za-restricted-page', accessRestricted);
+      runtime.ui.root.classList.toggle('za-guarded-page', visible);
+      if (visible) {
         runtime.ui.root.classList.add('za-open');
       } else if (!config.panelOpen) {
         runtime.ui.root.classList.remove('za-open');
       }
 
       if (runtime.ui.restrictedBanner) {
-        runtime.ui.restrictedBanner.hidden = !enabled;
+        runtime.ui.restrictedBanner.hidden = !visible;
       }
-      if (enabled && runtime.ui.restrictedBannerMessage) {
-        runtime.ui.restrictedBannerMessage.textContent = message || '检测到 BOSS 403 访问限制页，自动沟通已暂停。';
+      if (visible && runtime.ui.restrictedBannerTitle) {
+        runtime.ui.restrictedBannerTitle.textContent = guardInfo && guardInfo.title || '自动化已暂停';
+      }
+      if (visible && runtime.ui.restrictedBannerMessage) {
+        runtime.ui.restrictedBannerMessage.textContent = guardInfo && guardInfo.message
+          || state.pauseReason
+          || '自动沟通已暂停，请人工确认页面后再继续。';
+      }
+      if (runtime.ui.restrictedBannerResume) {
+        const canResume = Boolean(state.manualResumeRequired) && !enabled;
+        runtime.ui.restrictedBannerResume.hidden = !canResume;
+        runtime.ui.restrictedBannerResume.disabled = !canResume;
       }
 
       const debugSection = runtime.ui.root.querySelector('[data-feature-section="debugLog"]');
-      if (debugSection && enabled) debugSection.hidden = false;
+      if (debugSection && visible) debugSection.hidden = false;
       const startButton = runtime.ui.root.querySelector('[data-action="start"]');
-      if (startButton) startButton.disabled = enabled;
+      if (startButton) startButton.disabled = enabled || Boolean(state.active) || Boolean(state.manualResumeRequired);
+      this.applyFeatureBlockVisibility();
       this.renderDebugLogControls();
+      this.renderGuardPanel();
     },
 
     // 展开/收起面板并持久化到配置。
@@ -3989,6 +4189,10 @@
       if (runtime.statusLock && !(options && options.force)) return;
       runtime.ui.status.textContent = message || '';
       runtime.ui.status.dataset.type = type || 'info';
+      if (runtime.ui.guardCurrentStatus) {
+        runtime.ui.guardCurrentStatus.textContent = `当前状态：${message || '等待启动'}`;
+      }
+      this.renderGuardPanel();
     },
 
     // 显示筛选跳过原因，并让后续等待提示保留这条原因，避免用户只看到笼统的等待状态。
@@ -4022,6 +4226,58 @@
       if (start) start.disabled = Boolean(running);
       if (stop) stop.disabled = !running;
       this.setRuntimeConfigLocked(Boolean(running));
+      this.renderGuardPanel();
+    },
+
+    // 展示运行阶段、沟通数、最近一小时刷新次数和下一次刷新倒计时，帮助用户在暂停前发现风险。
+    renderGuardPanel() {
+      if (!runtime.ui) return;
+      const state = RunState.load() || {};
+      const refreshWindow = getAutoRefreshWindowState();
+      const phaseLabels = {
+        list: '列表扫描',
+        chat: '聊天发送',
+        returning: '返回列表',
+        paused: '已暂停',
+        stopped: '已停止',
+      };
+      let runLabel = state.active
+        ? `运行中 · ${phaseLabels[state.phase] || state.phase || '处理中'}`
+        : state.manualResumeRequired
+          ? '等待人工确认'
+          : phaseLabels[state.phase] || '待启动';
+      if (state.pauseAfterRefresh) runLabel = '刷新后已暂停';
+
+      let nextRefreshLabel = '未安排';
+      const nextRunAt = Number(state.nextRunAt || 0);
+      const nextAllowedAt = Number(refreshWindow.nextAllowedAt || 0);
+      const nextAt = nextRunAt > Date.now() ? nextRunAt : nextAllowedAt > Date.now() ? nextAllowedAt : 0;
+      if (nextAt) {
+        nextRefreshLabel = `约 ${Math.ceil((nextAt - Date.now()) / 1000)} 秒`;
+      } else if (state.pauseAfterRefresh || refreshWindow.count >= refreshWindow.limit) {
+        nextRefreshLabel = '已暂停';
+      }
+
+      if (runtime.ui.guardRunState) runtime.ui.guardRunState.textContent = runLabel;
+      if (runtime.ui.guardSentCount) runtime.ui.guardSentCount.textContent = String(Math.max(0, Number(state.sentCount || 0)));
+      if (runtime.ui.guardRefreshCount) runtime.ui.guardRefreshCount.textContent = `${refreshWindow.count}/${refreshWindow.limit}`;
+      if (runtime.ui.guardNextRefresh) runtime.ui.guardNextRefresh.textContent = nextRefreshLabel;
+      if (runtime.ui.guardCurrentStatus && runtime.ui.status && !runtime.ui.guardCurrentStatus.textContent) {
+        runtime.ui.guardCurrentStatus.textContent = `当前状态：${runtime.ui.status.textContent || '等待启动'}`;
+      }
+    },
+
+    // 运行中每秒刷新倒计时，空闲时降低频率，避免完整诊断日志和状态面板产生持续高开销。
+    scheduleGuardPanelRefresh() {
+      if (!runtime.ui) return;
+      if (runtime.ui.guardPanelTimer) clearTimeout(runtime.ui.guardPanelTimer);
+      const tick = () => {
+        if (!runtime.ui) return;
+        this.renderGuardPanel();
+        const state = RunState.load() || {};
+        runtime.ui.guardPanelTimer = setTimeout(tick, state.active ? 1000 : 5000);
+      };
+      tick();
     },
 
     // 运行中锁定配置，防止正在循环时更改等待时间、问候语来源等关键参数。
@@ -4253,6 +4509,12 @@
   const FastReplyService = {
     // 调用 BOSS 常用语接口并写入配置，UI 下拉框随之刷新。
     async refresh(showStatus) {
+      const guardInfo = getBossAutomationGuardInfo();
+      if (guardInfo) {
+        UI.setAutomationGuardMode(true, guardInfo);
+        UI.setStatus(`${guardInfo.message} 暂不获取常用语。`, 'error');
+        return;
+      }
       if (showStatus) UI.setStatus('正在获取常用语...', 'info');
 
       try {
@@ -4402,9 +4664,16 @@
     // 手动点击“开始”后的入口：校验配置、初始化存储和索引，然后进入列表循环。
     async start() {
       if (runtime.automationLoopActive) return;
-      if (isBossAccessRestrictedPage()) {
-        UI.setRestrictedPageMode(true, '当前是 BOSS 访问限制页，已禁止重新启动自动沟通。');
-        UI.setStatus('当前是 BOSS 访问限制页，已禁止启动自动沟通；请先导出诊断日志。', 'error');
+      const guardInfo = getBossAutomationGuardInfo();
+      if (guardInfo) {
+        UI.setAutomationGuardMode(true, guardInfo);
+        UI.setStatus(`${guardInfo.message} 当前已禁止启动自动沟通。`, 'error');
+        return;
+      }
+      const existingState = RunState.load();
+      if (existingState && existingState.manualResumeRequired) {
+        UI.setAutomationGuardMode(false);
+        UI.setStatus('任务正在等待人工确认，请先点击“人工确认后继续”。', 'warn');
         return;
       }
 
@@ -4477,6 +4746,10 @@
         chatOpenRetryCount: 0,
         listRefreshCount: 0,
         pauseAfterRefresh: false,
+        expectedNavigation: null,
+        manualResumeRequired: false,
+        manualResumePhase: '',
+        guardKind: '',
         startedAt: nowIso(),
       });
 
@@ -4499,13 +4772,23 @@
     },
 
     // 暂停自动化：保留当前状态给用户判断，但不再自动继续。
-    pause(reason) {
+    pause(reason, options) {
       runtime.stopRequested = true;
       runtime.automationLoopActive = false;
       UI.unlockStatus();
       const pauseReason = reason || '已暂停';
-      const state = RunState.pause(pauseReason);
+      const settings = options || {};
+      const currentState = RunState.load() || {};
+      const state = RunState.pause(pauseReason, {
+        manualResumeRequired: Boolean(settings.manualResumeRequired),
+        resumePhase: settings.resumePhase || currentState.phase || 'list',
+        guardKind: settings.guardKind || '',
+      });
       UI.setRunning(false);
+      const pageBlocked = settings.pageBlocked == null
+        ? Boolean(getBossAutomationGuardInfo())
+        : Boolean(settings.pageBlocked);
+      UI.setAutomationGuardMode(pageBlocked, settings.guardInfo || null);
       UI.setStatus(pauseReason, 'warn');
       logDebugEvent('automation_paused', {
         reason: pauseReason,
@@ -4513,10 +4796,112 @@
       }, 'warn', { force: true });
     },
 
+    // 页面刷新或异常页处理完成后，要求用户明确确认一次，再恢复原阶段。
+    async resumeAfterGuard() {
+      const guardInfo = getBossAutomationGuardInfo();
+      if (guardInfo) {
+        UI.setAutomationGuardMode(true, guardInfo);
+        UI.setStatus(`${guardInfo.message} 请先完成人工处理。`, 'error');
+        return;
+      }
+
+      const state = RunState.load();
+      if (!state || !state.manualResumeRequired) {
+        UI.setStatus('当前没有等待人工确认的任务。', 'info');
+        UI.setAutomationGuardMode(false);
+        return;
+      }
+
+      const phase = state.manualResumePhase && state.manualResumePhase !== 'paused'
+        ? state.manualResumePhase
+        : 'list';
+      RunState.patch({
+        active: true,
+        phase,
+        manualResumeRequired: false,
+        manualResumePhase: '',
+        guardKind: '',
+        expectedNavigation: null,
+        pauseReason: '',
+      });
+      UI.setAutomationGuardMode(false);
+      UI.unlockStatus();
+      UI.setStatus('已完成人工确认，正在恢复任务...', 'info');
+      logDebugEvent('automation_manual_resume', {
+        phase,
+        previousPauseReason: state.pauseReason,
+        previousGuardKind: state.guardKind,
+      }, 'warn', { force: true });
+      await this.resumeIfNeeded('manual-resume');
+    },
+
     // 页面加载、pageshow 或路由切换时调用，根据 RunState 恢复 list/chat/returning 阶段。
     async resumeIfNeeded(reason) {
       let state = RunState.load();
       if (!state || !state.active || runtime.automationLoopActive || runtime.resumeInProgress) return;
+
+      const guardInfo = getBossAutomationGuardInfo();
+      if (guardInfo) {
+        handleAutomationGuardPage(reason || 'resume', guardInfo);
+        return;
+      }
+
+      const resumeReason = reason || 'resume';
+      if (state.pauseAfterRefresh) {
+        const message = formatAutoRefreshLimitMessage(getAutoRefreshWindowState());
+        this.pause(message);
+        logDebugEvent('automation_paused_after_refresh_limit', {
+          reason: resumeReason,
+          runState: RunState.load(),
+          refreshWindow: getAutoRefreshWindowState(),
+        }, 'warn', { force: true });
+        return;
+      }
+
+      if (resumeReason === 'boot' || resumeReason === 'pageshow') {
+        const expectedNavigation = state.expectedNavigation;
+        if (!isExpectedNavigationCurrent(expectedNavigation)) {
+          const message = '检测到页面在未完成预期跳转时重新加载，任务已暂停；请人工确认页面后再继续';
+          this.pause(message, {
+            manualResumeRequired: true,
+            resumePhase: state.phase,
+            guardKind: 'unexpected_reload',
+            guardInfo: {
+              kind: 'unexpected_reload',
+              title: '等待人工确认',
+              message,
+            },
+          });
+          logDebugEvent('automation_manual_resume_required', {
+            reason: resumeReason,
+            expectedNavigation,
+            runState: RunState.load(),
+          }, 'warn', { force: true });
+          return;
+        }
+
+        if (expectedNavigation && expectedNavigation.kind === 'list_refresh') {
+          const message = '列表自动刷新已完成；请人工确认页面和筛选条件正常后，再点击“人工确认后继续”';
+          this.pause(message, {
+            manualResumeRequired: true,
+            resumePhase: 'list',
+            guardKind: 'list_refresh',
+            guardInfo: {
+              kind: 'list_refresh',
+              title: '刷新后等待人工确认',
+              message,
+            },
+          });
+          logDebugEvent('automation_manual_resume_after_list_refresh', {
+            reason: resumeReason,
+            expectedNavigation,
+            runState: RunState.load(),
+          }, 'warn', { force: true });
+          return;
+        }
+
+        RunState.patch({ expectedNavigation: null });
+      }
       runtime.resumeInProgress = true;
 
       try {
@@ -4964,6 +5349,7 @@
         listAnchorKey: listPosition.listAnchorKey || scanKey,
         listSnapshot: createJobListSnapshot(),
         chatOpenRetryCount: 0,
+        expectedNavigation: createExpectedNavigation('chat', 'chat'),
       });
 
       // 完整文档导航会把当前列表页放入 BFCache；先监听 pagehide，避免返回后旧超时器误停新流程。
@@ -5183,7 +5569,12 @@
         state: currentState,
       });
 
-      RunState.patch({ phase: 'returning', returnAttempts: attempts + 1, returnStartedAt });
+      RunState.patch({
+        phase: 'returning',
+        returnAttempts: attempts + 1,
+        returnStartedAt,
+        expectedNavigation: createExpectedNavigation('return', 'list'),
+      });
       const navigationResult = await navigateToJobList(currentState);
       // 短暂观察返回后是否发生第一页刷新，供后续扫描游标和刷新策略判断。
       await waitForReturnedJobListRefresh(returnStartedAt);
@@ -5240,6 +5631,7 @@
         returnAttempts: 0,
         returnStartedAt: null,
         intentionalListRestoreAt: null,
+        expectedNavigation: null,
         listSnapshot: createJobListSnapshot(),
       });
 
@@ -5390,6 +5782,7 @@
         stopReason: '',
         pauseReason: '',
         pauseAfterRefresh: reachedLimit,
+        expectedNavigation: createExpectedNavigation('list_refresh', 'list'),
       });
 
       runtime.stopRequested = false;
@@ -5418,56 +5811,58 @@
     },
   };
 
-  // 访问受限页只做诊断：自动暂停运行状态、保留页面信息，并把日志导出入口放到面板上。
-  function handleBossAccessRestrictedPage(reason) {
-    if (!runtime.ui || !isBossAccessRestrictedPage()) return;
+  // 所有异常/未识别页面都只保留人工处理入口，暂停状态并记录可导出的诊断信息。
+  function handleAutomationGuardPage(reason, guardInfo) {
+    if (!runtime.ui || !guardInfo) return;
 
-    const message = '检测到 BOSS 访问受限页，自动沟通已暂停；请先导出诊断日志。';
-    const firstVisit = runtime.lastRestrictedPageHref !== location.href;
+    const message = guardInfo.message || '检测到 BOSS 页面异常，自动沟通已暂停；请人工处理。';
+    const guardKey = `${guardInfo.kind || 'guard'}|${location.href}`;
+    const firstVisit = runtime.lastAutomationGuardKey !== guardKey;
     if (firstVisit) {
-      runtime.lastRestrictedPageHref = location.href;
+      runtime.lastAutomationGuardKey = guardKey;
       let autoEnabled = false;
-      try {
-        if (!isDebugEnabled()) {
-          localStorage.setItem(APP.debugEnabledKey, '1');
-          runtime.debugEvents = loadStoredDebugEvents();
-          autoEnabled = true;
-        }
-      } catch (_) {}
+      if (guardInfo.kind === 'access_restricted') {
+        try {
+          if (!isDebugEnabled()) {
+            localStorage.setItem(APP.debugEnabledKey, '1');
+            runtime.debugEvents = loadStoredDebugEvents();
+            autoEnabled = true;
+          }
+        } catch (_) {}
+      }
 
-      let urlInfo = {};
-      try {
-        const url = new URL(location.href);
-        urlInfo = {
-          code: url.searchParams.get('code') || '',
-          pathname: url.pathname,
-        };
-      } catch (_) {}
-
-      logDebugEvent('boss_access_restricted_page', {
+      logDebugEvent('boss_automation_guard_page', {
         reason,
+        kind: guardInfo.kind || '',
+        title: guardInfo.title || '',
         href: location.href,
-        title: normalizeText(document.title),
-        pageText: summarizeLongText(document.body && (document.body.innerText || document.body.textContent) || ''),
-        urlInfo,
+        pageTitle: normalizeText(document.title),
+        pageText: summarizeLongText(getBossPageTextWithoutOwnUi()),
         runState: RunState.load(),
         autoEnabledDebugLogging: autoEnabled,
-      }, 'error');
+      }, 'error', { force: true });
     }
 
     const state = RunState.load();
     if (state && state.active) {
-      Automation.pause(message);
-      logDebugEvent('automation_paused_access_restricted', {
-        reason,
-        runState: RunState.load(),
-      }, 'warn');
+      Automation.pause(message, {
+        manualResumeRequired: true,
+        resumePhase: state.phase,
+        guardKind: guardInfo.kind || 'guard_page',
+        guardInfo,
+      });
     } else {
       UI.setRunning(false);
+      UI.setAutomationGuardMode(true, guardInfo);
     }
-
-    UI.setRestrictedPageMode(true, message);
     UI.setStatus(message, 'error');
+  }
+
+  // 兼容旧命名；403 访问限制页现在也由统一异常页拦截处理。
+  function handleBossAccessRestrictedPage(reason) {
+    if (!runtime.ui || !isBossAccessRestrictedPage()) return;
+    const guardInfo = getBossAutomationGuardInfo();
+    if (guardInfo) handleAutomationGuardPage(reason, guardInfo);
   }
 
   // 导出器：JSON/Excel 都在前端生成，下载时强制补扩展名，避免保存成无后缀 blob。
@@ -7813,6 +8208,7 @@
         intentionalListRestoreAt: Date.now(),
         listUrl: targetListUrl,
         listFilterSignature: expectedSignature || makeJobListFilterSignature(targetListUrl),
+        expectedNavigation: createExpectedNavigation('return', 'list'),
       });
       pageWindow.location.assign(targetListUrl);
       await waitFor(
@@ -9814,6 +10210,51 @@
         border-color: #fecdca;
         color: #b42318;
       }
+      #zhipin-auto-greeting-root .za-guard-panel {
+        flex: 0 0 auto;
+        margin: 8px 14px 0;
+        padding: 8px 10px;
+        border: 1px solid #e4e7ec;
+        border-radius: 7px;
+        background: #fbfcfd;
+        color: #475467;
+        font-size: 11px;
+      }
+      #zhipin-auto-greeting-root .za-guard-grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 6px 10px;
+      }
+      #zhipin-auto-greeting-root .za-guard-grid > div {
+        display: flex;
+        align-items: baseline;
+        justify-content: space-between;
+        gap: 6px;
+        min-width: 0;
+      }
+      #zhipin-auto-greeting-root .za-guard-grid span {
+        color: #667085;
+        white-space: nowrap;
+      }
+      #zhipin-auto-greeting-root .za-guard-grid strong {
+        min-width: 0;
+        overflow: hidden;
+        color: #344054;
+        font-weight: 600;
+        text-align: right;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      #zhipin-auto-greeting-root .za-guard-current {
+        margin-top: 6px;
+        padding-top: 6px;
+        border-top: 1px solid #eaecf0;
+        overflow: hidden;
+        color: #667085;
+        line-height: 1.45;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
       #zhipin-auto-greeting-root .za-restricted-banner {
         flex: 0 0 auto;
         margin: 12px 14px 0;
@@ -10499,6 +10940,9 @@
         #zhipin-auto-greeting-root .za-api-endpoint {
           grid-template-columns: 1fr;
         }
+        #zhipin-auto-greeting-root .za-guard-grid {
+          grid-template-columns: 1fr;
+        }
         #zhipin-auto-greeting-root .za-textarea-row {
           flex-direction: column;
           align-items: stretch;
@@ -10529,7 +10973,7 @@
     const wasMounted = Boolean(runtime.ui);
     const allowed = syncAllowedPageUi();
     // 恢复流程内部会按页面阶段等待对应 DOM，无需在 pageshow 后再盲等固定时间。
-    if (wasMounted && allowed && isAllowedDisplayPage() && !isBossAccessRestrictedPage()) {
+    if (wasMounted && allowed && isAllowedDisplayPage() && !getBossAutomationGuardInfo()) {
       Automation.resumeIfNeeded('pageshow');
     }
   });

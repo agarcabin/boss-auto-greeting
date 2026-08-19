@@ -516,15 +516,46 @@
     return Boolean(state && (state.active || state.manualResumeRequired));
   }
 
-  // 只读取页面可见文本并移除脚本自己的面板，避免把“暂停/导出日志”等文案误判为 BOSS 异常页。
+  // 只读取可见的高信号弹窗/错误容器并移除脚本自己的面板，避免把岗位或 JD 正文误判为异常页。
   function getBossPageTextWithoutOwnUi() {
     try {
-      const pageCopy = document.body && document.body.cloneNode(true);
-      const ownUi = pageCopy && pageCopy.querySelector('#zhipin-auto-greeting-root');
-      if (ownUi) ownUi.remove();
-      return normalizeText(pageCopy && (pageCopy.innerText || pageCopy.textContent) || '');
+      const candidates = [];
+      // 列表搜索词或聊天岗位名可能进入 document.title，已知业务页不把标题当作异常证据。
+      if (document.title && !isJobListUrl(location.href) && !isChatPage()) candidates.push(document.title);
+
+      const guardSelectors = [
+        '[role="dialog"]',
+        '[role="alert"]',
+        '[aria-live="assertive"]',
+        '.dialog',
+        '.dialog-wrap',
+        '.dialog-container',
+        '.dialog-layer',
+        '.modal',
+        '.modal-dialog',
+        '.popup',
+        '.popup-wrap',
+        '.error-page',
+        '.error-container',
+        '.error-content',
+        '.exception-page',
+        '.page-error',
+        '[class*="captcha"]',
+        '[class*="verify"]',
+        '[class*="security"]',
+        '[class*="error"]',
+        '[class*="exception"]',
+      ].join(',');
+
+      document.querySelectorAll(guardSelectors).forEach((element) => {
+        if (isOwnUiElement(element) || !isVisible(element)) return;
+        const text = normalizeText(element.innerText || element.textContent || '');
+        if (text) candidates.push(text.slice(0, 5000));
+      });
+
+      return Array.from(new Set(candidates)).join(' ');
     } catch (_) {
-      return normalizeText(document.body && (document.body.innerText || document.body.textContent) || '');
+      return '';
     }
   }
 
@@ -556,25 +587,25 @@
         {
           kind: 'login_required',
           title: '需要人工登录',
-          pattern: /登录已失效|登录过期|请先登录|请登录后|重新登录|扫码登录|密码登录/,
+          pattern: /登录已失效|登录过期|请先登录|请登录后|重新登录|登录状态异常/,
           message: '检测到 BOSS 登录状态异常，自动沟通已暂停；请人工完成登录后再继续。',
         },
         {
           kind: 'security_verification',
           title: '需要人工验证',
-          pattern: /验证码|安全验证|人机验证|滑动验证|验证身份|异常登录|安全检查/,
+          pattern: /安全验证|人机验证|滑动验证|验证身份|安全检查|请完成验证|请输入验证码|输入验证码|验证码校验|检测到异常登录/,
           message: '检测到 BOSS 安全验证页面，自动沟通已暂停；请人工完成验证后再继续。',
         },
         {
           kind: 'account_risk',
           title: '账号风险提示',
-          pattern: /账号(?:存在)?异常|账户(?:存在)?异常|异常行为|风险控制|风险提示|访问受限|暂时无法访问/,
+          pattern: /账号(?:存在)?异常|账户(?:存在)?异常|异常行为|访问受限|暂时无法访问|风险控制(?:系统|提示)|(?:账号|账户|访问).{0,8}风险/,
           message: '检测到 BOSS 账号或访问风险提示，自动沟通已暂停；请人工确认页面后再继续。',
         },
         {
           kind: 'page_error',
           title: '页面或网络异常',
-          pattern: /网络异常|网络错误|请求失败|加载失败|系统繁忙|服务异常|页面出错|稍后再试/,
+          pattern: /网络异常|网络错误|请求失败|加载失败|系统繁忙|服务异常|页面出错|页面加载失败|请稍后再试|稍后再试/,
           message: '检测到 BOSS 页面或网络异常，自动沟通已暂停；请人工确认页面恢复后再继续。',
         },
       ];
@@ -584,7 +615,7 @@
 
       // 任务进行中却落在未识别的 BOSS 页面时也拦截，防止脚本把未知页面当成列表继续操作。
       const knownRoute = isJobListUrl(url.href) || pathname === '/web/geek/chat';
-      if (hasPendingAutomationRun() && /^\/web\//.test(pathname) && !knownRoute) {
+      if (hasPendingAutomationRun() && !knownRoute) {
         return {
           kind: 'unknown_route',
           title: '未识别的 BOSS 页面',
@@ -4273,11 +4304,40 @@
       if (runtime.ui.guardPanelTimer) clearTimeout(runtime.ui.guardPanelTimer);
       const tick = () => {
         if (!runtime.ui) return;
+        this.syncAutomationGuardState();
         this.renderGuardPanel();
         const state = RunState.load() || {};
         runtime.ui.guardPanelTimer = setTimeout(tick, state.active ? 1000 : 5000);
       };
       tick();
+    },
+
+    // 异常弹窗可能在当前页面内被人工关闭；低频重评估后显示恢复按钮，但不自动恢复任务。
+    syncAutomationGuardState() {
+      if (!runtime.ui || !runtime.ui.root) return;
+
+      const guardInfo = getBossAutomationGuardInfo();
+      const state = RunState.load() || {};
+      const rootIsGuarded = runtime.ui.root.classList.contains('za-guarded-page');
+      const resumeButtonHidden = runtime.ui.restrictedBannerResume && runtime.ui.restrictedBannerResume.hidden;
+
+      if (guardInfo) {
+        if (state.active) {
+          handleAutomationGuardPage('watch', guardInfo);
+        } else if (!rootIsGuarded || !runtime.ui.restrictedBanner || runtime.ui.restrictedBanner.hidden) {
+          this.setAutomationGuardMode(true, guardInfo);
+        }
+        return;
+      }
+
+      if (state.manualResumeRequired && (rootIsGuarded || resumeButtonHidden)) {
+        this.setAutomationGuardMode(false);
+        return;
+      }
+
+      if (!state.manualResumeRequired && rootIsGuarded) {
+        this.setAutomationGuardMode(false);
+      }
     },
 
     // 运行中锁定配置，防止正在循环时更改等待时间、问候语来源等关键参数。

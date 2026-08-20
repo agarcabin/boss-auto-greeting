@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BOSS直聘自动沟通助手
 // @namespace    local.codex.zhipin
-// @version      0.1.15
+// @version      0.1.16
 // @description  在 BOSS 直聘搜索结果页自动选择岗位、发送常用语或自定义问候语，并记录岗位数据。
 // @match        https://www.zhipin.com/web/geek/jobs*
 // @match        https://www.zhipin.com/web/geek/chat*
@@ -10,6 +10,7 @@
 // @run-at       document-start
 // @grant        unsafeWindow
 // @grant        GM_xmlhttpRequest
+// @grant        GM_notification
 // @connect      127.0.0.1
 // @connect      localhost
 // @connect      *
@@ -40,7 +41,7 @@
   // 全局常量：集中维护脚本版本、存储 key、BOSS 接口特征和默认问候语。
   const APP = {
     name: 'BOSS自动沟通',
-    version: '0.1.14',
+    version: '0.1.16',
     githubVersionUrl: 'https://raw.githubusercontent.com/agarcabin/boss-auto-greeting/main/zhipin-auto-greeting.user.js',
     dbName: 'ZhipinAutoGreetingDB',
     dbVersion: 1,
@@ -186,9 +187,14 @@
     contactedIndexReady: false,
     // 自动化运行锁和停止标记，避免重复启动多个并发循环。
     automationLoopActive: false,
+    // 每次停止/暂停/人工恢复都会递增；旧页面异步任务拿着旧 token 时只能退出，不能影响新一轮。
+    automationRunToken: 0,
     resumeInProgress: false,
     stopRequested: false,
     statusLock: null,
+    haltAlertShown: false,
+    haltAlertMessage: '',
+    haltNotificationPermissionRequested: false,
     jobNameFilterEdited: false,
     configFormTouched: false,
     lastSkipReason: '',
@@ -1173,6 +1179,7 @@
         const url = normalizeRequestUrl(input);
         const requestMeta = createFetchRequestMeta(input, init, url);
         rememberTrackedJobRequest(url, requestMeta);
+        captureFetchRequestBody(input, requestMeta);
         const result = rawFetch.apply(this, arguments);
 
         if (isTrackedJobApi(url)) {
@@ -1274,6 +1281,29 @@
       body: requestInit.body,
       source: 'fetch',
     };
+  }
+
+  // fetch(Request) 的请求体只能通过 clone 异步读取；读取副本不会消耗页面真正发送的 body。
+  // 这样列表接口即使把分页字段放在 Request body 中，也能参与批次合并和安全重放。
+  function captureFetchRequestBody(input, requestMeta) {
+    if (!input || !requestMeta || requestMeta.body !== undefined && requestMeta.body !== null) return;
+
+    const method = normalizeText(requestMeta.method || 'GET').toUpperCase();
+    if (method === 'GET' || method === 'HEAD') return;
+    const captureStartedAt = Date.now();
+
+    try {
+      const clonedRequest = typeof input.clone === 'function' ? input.clone() : null;
+      if (!clonedRequest || typeof clonedRequest.text !== 'function') return;
+      clonedRequest.text().then((body) => {
+        if (body === undefined || body === null || body === '') return;
+        requestMeta.body = body;
+        const latestCapturedAt = Number(runtime.latestJobListRequest && runtime.latestJobListRequest.capturedAt || 0);
+        if (!latestCapturedAt || latestCapturedAt <= captureStartedAt) {
+          rememberTrackedJobRequest(requestMeta.url, requestMeta);
+        }
+      }).catch(() => {});
+    } catch (_) {}
   }
 
   // 从 XHR 实例上读取 open/setRequestHeader 阶段保存的信息，生成统一请求元数据。
@@ -1525,8 +1555,91 @@
     return `count:${(jobs || []).length}:${hashString(JSON.stringify(jobs || []).slice(0, 1200))}`;
   }
 
-  // 去掉页码、时间戳、随机数等波动参数，得到“这次搜索条件”的稳定上下文 key。
-  function makeJobListContextKey(url) {
+  // 将列表请求体转换成有限深度的键值对；只用于分页识别和稳定指纹，不写入导出的日志正文。
+  function getJobListRequestBodyEntries(body) {
+    const entries = [];
+    const append = (value, prefix, depth) => {
+      if (!prefix || depth > 3 || value === undefined || value === null) return;
+
+      if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+        entries.push([prefix, normalizeText(value)]);
+        return;
+      }
+
+      if (Array.isArray(value)) {
+        if (value.every((item) => item === null || ['string', 'number', 'boolean'].includes(typeof item))) {
+          entries.push([prefix, value.map((item) => normalizeText(item)).join(',')]);
+          return;
+        }
+        value.forEach((item, index) => append(item, `${prefix}[${index}]`, depth + 1));
+        return;
+      }
+
+      if (typeof value === 'object') {
+        Object.keys(value).sort().forEach((key) => {
+          append(value[key], prefix ? `${prefix}.${key}` : key, depth + 1);
+        });
+      }
+    };
+
+    if (body === undefined || body === null || body === '') return entries;
+
+    try {
+      if (typeof URLSearchParams !== 'undefined' && body instanceof URLSearchParams) {
+        body.forEach((value, key) => append(value, key, 0));
+        return entries;
+      }
+
+      if (typeof FormData !== 'undefined' && body instanceof FormData) {
+        body.forEach((value, key) => append(
+          value && typeof value === 'object' && 'name' in value ? value.name : value,
+          key,
+          0,
+        ));
+        return entries;
+      }
+
+      if (typeof body === 'string') {
+        const text = body.trim();
+        if (!text) return entries;
+
+        try {
+          const parsed = JSON.parse(text);
+          if (parsed && typeof parsed === 'object') {
+            Object.keys(parsed).sort().forEach((key) => append(parsed[key], key, 0));
+            return entries;
+          }
+        } catch (_) {}
+
+        try {
+          const params = new URLSearchParams(text);
+          params.forEach((value, key) => append(value, key, 0));
+          if (entries.length) return entries;
+        } catch (_) {}
+        return entries;
+      }
+
+      if (typeof body === 'object') {
+        Object.keys(body).sort().forEach((key) => append(body[key], key, 0));
+      }
+    } catch (_) {}
+
+    return entries.filter(([key, value]) => normalizeText(key) && normalizeText(value));
+  }
+
+  function getJobListParamLeafName(name) {
+    const parts = String(name || '').split(/[.[\]]/).filter(Boolean);
+    return (parts[parts.length - 1] || '').toLowerCase();
+  }
+
+  function isJobListCursorParam(name) {
+    return /^(?:cursor|nextcursor|lastcursor|after|before|lastid|lastjobid|lastjobkey|nextid|nextjobid|nextjobkey)$/i.test(
+      getJobListParamLeafName(name),
+    );
+  }
+
+  // 去掉页码、游标、时间戳、随机数等波动参数，得到“这次搜索条件”的稳定上下文 key。
+  function makeJobListContextKey(url, requestMeta) {
     try {
       const target = new URL(url, location.href);
       const params = [];
@@ -1541,14 +1654,25 @@
       const search = params
         .map(([key, value]) => `${encodeURIComponent(key)}=${encodeURIComponent(value)}`)
         .join('&');
-      return `${target.origin}${target.pathname}?${search}`;
+
+      const bodyParams = getJobListRequestBodyEntries(requestMeta && requestMeta.body)
+        .filter(([key, value]) => !isVolatileJobListParam(key) && normalizeText(value))
+        .sort((left, right) => {
+          const keyCompared = left[0].localeCompare(right[0]);
+          return keyCompared || left[1].localeCompare(right[1]);
+        });
+      const bodyScope = bodyParams
+        .map(([key, value]) => `${key}=${value}`)
+        .join('&');
+      const bodySuffix = bodyScope ? `&__body=${encodeURIComponent(hashString(bodyScope))}` : '';
+
+      return `${target.origin}${target.pathname}?${search}${bodySuffix}`;
     } catch (_) {
       return `unknown:${normalizeText(url).split(/[?#]/)[0]}`;
     }
   }
 
-  // BOSS 不同接口可能用 page/offset 等不同分页字段，这里统一解析为页码。
-  function getJobListPageNumber(url) {
+  function getUrlJobListPageNumber(url) {
     try {
       const target = new URL(url, location.href);
       const pageKeys = ['page', 'pageNo', 'pageNum', 'pageIndex', 'current', 'currentPage'];
@@ -1567,9 +1691,80 @@
     return 1;
   }
 
+  // BOSS 不同版本可能把分页/游标放在 URL 或 POST body 中，这里统一提取页码和续接标记。
+  function getJobListRequestPagination(url, requestMeta) {
+    const entries = getJobListRequestBodyEntries(requestMeta && requestMeta.body);
+    let pageNumber = getUrlJobListPageNumber(url);
+    let offset = 0;
+    let limit = 0;
+    let isContinuation = pageNumber > 1;
+
+    try {
+      const target = new URL(url, location.href);
+      target.searchParams.forEach((rawValue, rawName) => {
+        const key = getJobListParamLeafName(rawName);
+        const value = normalizeText(rawValue);
+        if (!value) return;
+        if (['offset', 'start', 'startindex'].includes(key) && Number(value) > 0) {
+          isContinuation = true;
+        }
+        if (isJobListCursorParam(key)) isContinuation = true;
+      });
+    } catch (_) {}
+
+    entries.forEach(([name, rawValue]) => {
+      const key = getJobListParamLeafName(name);
+      const value = normalizeText(rawValue);
+      if (!value) return;
+
+      if (['page', 'pageno', 'pagenum', 'pageindex', 'current', 'currentpage', 'pagenumber'].includes(key)) {
+        const page = Number(value);
+        if (Number.isFinite(page) && page > 0) {
+          pageNumber = Math.max(pageNumber, page);
+          if (page > 1) isContinuation = true;
+        }
+        return;
+      }
+
+      if (['offset', 'start', 'startindex'].includes(key)) {
+        const parsedOffset = Number(value);
+        if (Number.isFinite(parsedOffset) && parsedOffset > 0) {
+          offset = Math.max(offset, parsedOffset);
+          isContinuation = true;
+        }
+        return;
+      }
+
+      if (['limit', 'pagesize'].includes(key)) {
+        const parsedLimit = Number(value);
+        if (Number.isFinite(parsedLimit) && parsedLimit > 0) limit = Math.max(limit, parsedLimit);
+        return;
+      }
+
+      if (isJobListCursorParam(key)) {
+        isContinuation = true;
+      }
+    });
+
+    if (offset > 0 && limit > 0) {
+      pageNumber = Math.max(pageNumber, Math.floor(offset / limit) + 1);
+    }
+
+    return {
+      pageNumber: Number.isFinite(pageNumber) && pageNumber > 0 ? pageNumber : 1,
+      isContinuation,
+      bodyEntryCount: entries.length,
+    };
+  }
+
+  function getJobListPageNumber(url, requestMeta) {
+    return getJobListRequestPagination(url, requestMeta).pageNumber;
+  }
+
   // 这些参数会随请求变化，不应参与搜索上下文判断。
   function isVolatileJobListParam(name) {
-    return /^(?:_|t|ts|time|timestamp|callback|cb|r|random|ka|lid|securityId|sessionId|sid|traceId|page|pageNo|pageNum|pageIndex|current|currentPage|pageSize|limit|offset|start|startIndex)$/i.test(String(name || ''));
+    const key = getJobListParamLeafName(name);
+    return /^(?:_|t|ts|time|timestamp|callback|cb|r|random|ka|lid|securityid|sessionid|sid|traceid|page|pageno|pagenum|pageindex|current|currentpage|pagenumber|pagesize|limit|offset|start|startindex|cursor|nextcursor|lastcursor|after|before|lastid|lastjobid|lastjobkey|nextid|nextjobid|nextjobkey)$/i.test(key);
   }
 
   // 处理岗位列表响应：解析岗位数组、重置/追加当前列表数据池、并尝试重绑 DOM 卡片。
@@ -1581,17 +1776,32 @@
       const jobs = JobRepository.extractJobList(payload);
       if (!jobs.length) return;
 
-      const contextKey = makeJobListContextKey(url);
-      const pageNumber = getJobListPageNumber(url);
+      const pagination = getJobListRequestPagination(url, requestMeta);
+      const contextKey = makeJobListContextKey(url, requestMeta);
+      const pageNumber = pagination.pageNumber;
       const batchKey = makeJobListBatchKey(jobs);
       const scopedBatchKey = `${contextKey}::${batchKey}`;
-      const shouldReplaceScope = JobRepository.shouldReplaceJobListScope(contextKey, pageNumber);
+      // 先用索引 0 生成一份轻量样本，仅用于判断同一可见列表中的前后批次关系。
+      const incomingSampleJobs = jobs.map((rawJob, index) => JobRepository.normalizeJob(rawJob, index, {
+        source,
+        sourceUrl: url,
+      }));
+      const alreadySeenCurrentBatch = contextKey === runtime.jobListContextKey &&
+        runtime.seenApiBatches.has(scopedBatchKey);
+      const shouldReplaceScope = alreadySeenCurrentBatch
+        ? false
+        : JobRepository.shouldReplaceJobListScope(contextKey, pageNumber, {
+          isContinuation: pagination.isContinuation,
+          jobs: incomingSampleJobs,
+        });
 
       JobRepository.noteJobListResponse({
         url,
         source,
         contextKey,
         pageNumber,
+        isFirstPage: shouldReplaceScope,
+        isContinuation: pagination.isContinuation || !shouldReplaceScope,
         batchKey,
         jobCount: jobs.length,
       });
@@ -1603,13 +1813,19 @@
         batchKey,
         scopedBatchKey,
         shouldReplaceScope,
+        alreadySeenCurrentBatch,
+        pagination: {
+          isContinuation: pagination.isContinuation,
+          bodyEntryCount: pagination.bodyEntryCount,
+        },
         jobCount: jobs.length,
         firstJobs: jobs.slice(0, 5).map(summarizeRawJob),
         request: summarizeJobListRequest(requestMeta),
         listState: getDebugListState(),
       });
 
-      if (runtime.seenApiBatches.has(scopedBatchKey) && !shouldReplaceScope) return;
+      // 同一搜索条件下重复收到同一批次时直接忽略，避免重复响应把已合并的岗位池重新覆盖。
+      if (alreadySeenCurrentBatch) return;
 
       if (shouldReplaceScope) {
         JobRepository.resetJobListScope(contextKey);
@@ -1719,7 +1935,10 @@
       runtime.jobListResponseSerial = record.serial;
       runtime.latestJobListResponse = record;
 
-      if (Number(record.pageNumber || 1) <= 1) {
+      const isFirstPage = record.isFirstPage == null
+        ? Number(record.pageNumber || 1) <= 1 && !record.isContinuation
+        : Boolean(record.isFirstPage);
+      if (isFirstPage) {
         runtime.jobListFirstPageSerial += 1;
         runtime.latestFirstPageJobListResponse = Object.assign({}, record, {
           firstPageSerial: runtime.jobListFirstPageSerial,
@@ -1729,11 +1948,66 @@
       return record;
     },
 
-    // 搜索条件变化或重新请求第一页时，旧的岗位池不再可信，需要整体替换。
-    shouldReplaceJobListScope(contextKey, pageNumber) {
+    // 搜索条件变化或真正回到第一页时替换；同一可见列表中的后续批次必须追加。
+    shouldReplaceJobListScope(contextKey, pageNumber, options) {
       if (!runtime.jobListContextKey) return true;
       if (contextKey && contextKey !== runtime.jobListContextKey) return true;
-      return Number(pageNumber || 1) <= 1;
+      const settings = options || {};
+      if (settings.isContinuation || Number(pageNumber || 1) > 1) return false;
+      return !this.shouldAppendSameContextBatch(settings.jobs || []);
+    },
+
+    // 某些 BOSS 版本用相同 URL 连续返回多个 15 条批次。若新批次对应可见卡片的后半段，
+    // 说明它是当前列表的续接数据，即使请求体没有暴露 page/offset，也不能覆盖前一批次。
+    shouldAppendSameContextBatch(incomingJobs) {
+      if (!runtime.jobPool.length || !Array.isArray(incomingJobs) || !incomingJobs.length) return false;
+
+      const cards = getJobCards();
+      if (!cards.length) return false;
+      const domInfos = cards.map((card) => extractCardInfo(card));
+
+      const findCardPositions = (jobs) => {
+        const usedPositions = new Set();
+        const positions = [];
+        (jobs || []).forEach((job) => {
+          const position = domInfos.findIndex((domInfo, index) => {
+            if (usedPositions.has(index)) return false;
+            return this.cardLooksLikeJob(domInfo, job).matched;
+          });
+          if (position >= 0) {
+            usedPositions.add(position);
+            positions.push(position);
+          }
+        });
+        return positions;
+      };
+
+      const currentPositions = findCardPositions(runtime.jobPool);
+      const incomingPositions = findCardPositions(incomingJobs);
+      if (currentPositions.length && incomingPositions.length) {
+        const incomingPositionSet = new Set(incomingPositions);
+        const hasPositionOverlap = currentPositions.some((position) => incomingPositionSet.has(position));
+        if (!hasPositionOverlap && cards.length >= currentPositions.length + incomingPositions.length) {
+          // 响应可能乱序到达；只要两批岗位分别占据可见卡片的不同区间，也应合并而不是覆盖。
+          return true;
+        }
+
+        const currentMin = Math.min(...currentPositions);
+        const currentMax = Math.max(...currentPositions);
+        const incomingMin = Math.min(...incomingPositions);
+        const incomingMax = Math.max(...incomingPositions);
+
+        // 新批次完全位于当前批次后方：典型的同 URL 分页/虚拟列表响应。
+        if (incomingMin > currentMax) return true;
+        // 新批次完全位于当前批次前方：当前响应更像是一次新的第一页替换。
+        if (incomingMax < currentMin) return false;
+        // 有重叠或顺序不明确时宁可替换，避免把旧列表和新搜索结果混在一起。
+        return false;
+      }
+
+      // 如果 DOM 已经明显包含两批卡片，但当前池只覆盖前一部分，也允许追加。
+      return cards.length >= runtime.jobPool.length + incomingJobs.length - 2 &&
+        incomingPositions.length > 0;
     },
 
     // 清空当前列表池和索引，通常发生在搜索条件变化、第一页刷新或接口数据错位时。
@@ -1757,8 +2031,18 @@
 
     // 将列表接口中的岗位放入池中，并维护各种强/弱索引。
     rememberListJob(job) {
+      const existing = job && runtime.jobByKey.get(job.jobKey);
+      if (existing) {
+        const merged = mergeJobInfo(existing, job);
+        const index = runtime.jobPool.indexOf(existing);
+        if (index >= 0) runtime.jobPool[index] = merged;
+        this.rebuildJobIndexes();
+        return merged;
+      }
+
       runtime.jobPool.push(job);
       this.addJobToIndexes(job);
+      return job;
     },
 
     // 建立岗位多维索引：强 ID、岗位+公司+薪资签名、岗位+公司弱签名。
@@ -2437,41 +2721,47 @@
       return { comparable: false, matched: false };
     },
 
-    // 当前接口池是否能服务当前可见卡片；如果搜索/刷新导致错位，会触发重置。
+    // 当前接口池是否完整覆盖当前可见卡片；暂时错位时交给等待器继续等后续批次。
     isJobPoolUsableForCards(cards) {
       const visibleCards = cards || getJobCards();
       if (!visibleCards.length) return true;
-      if (this.canUseIndexedFallback(visibleCards)) return true;
 
-      const samples = visibleCards.slice(0, 5);
-      return samples.some((card, index) => {
+      const usedJobKeys = new Set();
+      let matchedCount = 0;
+      visibleCards.forEach((card, index) => {
         const matched = this.findApiJobForCard(
           extractCardInfo(card),
           index,
-          new Set(),
+          usedJobKeys,
           { allowIndexFallback: false },
         );
-        return Boolean(matched);
+        if (!matched) return;
+        matchedCount += 1;
+        usedJobKeys.add(matched.jobKey);
       });
+
+      // DOM 已经展示多批卡片而岗位池只捕获到其中一批时，不能把“前几条能匹配”误判为可运行。
+      // 等待后续接口批次到达，避免用不完整池子扫描并触发误停。
+      if (visibleCards.length > runtime.jobPool.length && matchedCount < visibleCards.length) return false;
+      if (matchedCount >= visibleCards.length) return true;
+      if (this.canUseIndexedFallback(visibleCards)) return true;
+      return matchedCount >= Math.min(3, visibleCards.length);
     },
 
     // 列表自动化启动前等待接口数据；等不到时尝试主动补拉最近的岗位列表接口。
     async waitForApiData(timeout) {
       if (runtime.jobPool.length) {
         if (this.isJobPoolUsableForCards()) return true;
-
-        this.resetJobListScope('');
       }
 
       try {
         await waitFor(
-          () => runtime.jobPool.length > 0,
+          () => runtime.jobPool.length > 0 && this.isJobPoolUsableForCards(),
           timeout || 1800,
           '岗位接口数据',
           { pollInterval: 120 },
         );
         if (this.isJobPoolUsableForCards()) return true;
-        this.resetJobListScope('');
       } catch (_) {}
 
       const fetched = await this.fetchLatestJobList().catch((error) => {
@@ -2972,6 +3262,19 @@
             <p class="za-hint" data-role="restrictedBannerLogStatus">日志 0 条</p>
           </div>
 
+          <div class="za-halt-alert-backdrop" data-role="haltAlertBackdrop" hidden>
+            <div class="za-halt-alert-dialog" role="alertdialog" aria-modal="true" aria-labelledby="za-halt-alert-title" aria-describedby="za-halt-alert-message">
+              <div class="za-halt-alert-pulse" aria-hidden="true">!</div>
+              <div class="za-halt-alert-content">
+                <div class="za-halt-alert-kicker">自动化安全提醒</div>
+                <div class="za-halt-alert-title" id="za-halt-alert-title">自动沟通已停止</div>
+                <div class="za-halt-alert-message" data-role="haltAlertMessage" id="za-halt-alert-message">脚本已停止继续投递。</div>
+                <div class="za-halt-alert-hint">请人工检查页面、账号和网络状态；确认无误后再重新启动。</div>
+                <button type="button" class="za-halt-alert-ack" data-action="dismissHaltAlert">我已看到，保持暂停</button>
+              </div>
+            </div>
+          </div>
+
           <section class="za-section" data-feature-section="greeting">
             <h3>打招呼配置</h3>
             <div class="za-subsection">
@@ -3071,10 +3374,10 @@
                 <label>最小间隔(秒)<input data-field="delayMin" type="number" min="1" step="1"></label>
                 <label>最大间隔(秒)<input data-field="delayMax" type="number" min="1" step="1"></label>
                 <label>等待上限(秒)<input data-field="waitTimeout" type="number" min="2" step="1"></label>
-                <label>最大沟通数<input data-field="maxCount" type="number" min="0" step="1"></label>
+                <label>今日最大沟通数<input data-field="maxCount" type="number" min="0" step="1"></label>
                 <label>一小时内刷新上限<input data-field="maxListRefresh" type="number" min="1" max="3" step="1" title="最近一小时内最多自动刷新3次，达到上限后暂停任务"></label>
               </div>
-              <p class="za-hint">列表耗尽后等待 60 秒再刷新；最近一小时累计达到 3 次后暂停任务。网络异常、页面加载失败或按钮点击失败时会立即暂停，不会自动重试。</p>
+              <p class="za-hint">今日最大沟通数按顶部“今日已投递”累计数计算；留空或填 0 表示不限制。列表耗尽后等待 60 秒再刷新；最近一小时累计达到 3 次后暂停任务。网络异常、页面加载失败或按钮点击失败时会立即暂停，不会自动重试。</p>
             </div>
           </section>
 
@@ -3231,6 +3534,9 @@
         restrictedBannerMessage: root.querySelector('[data-role="restrictedBannerMessage"]'),
         restrictedBannerLogStatus: root.querySelector('[data-role="restrictedBannerLogStatus"]'),
         restrictedBannerResume: root.querySelector('[data-action="resumeAfterGuard"]'),
+        haltAlertBackdrop: root.querySelector('[data-role="haltAlertBackdrop"]'),
+        haltAlertMessage: root.querySelector('[data-role="haltAlertMessage"]'),
+        haltAlertAcknowledge: root.querySelector('[data-action="dismissHaltAlert"]'),
         fastReplyInput: root.querySelector('[data-field="fastReplyIndex"]'),
         fastReplyTrigger: root.querySelector('[data-action="toggleFastReplyPicker"]'),
         fastReplyTriggerText: root.querySelector('[data-role="fastReplyTriggerText"]'),
@@ -3359,6 +3665,10 @@
           Automation.resumeAfterGuard();
           return;
         }
+        if (action === 'dismissHaltAlert') {
+          this.dismissHaltAlert();
+          return;
+        }
         if (action === 'selectFastReply') {
           this.selectFastReply(target.dataset.index);
           return;
@@ -3431,6 +3741,12 @@
       });
 
       root.addEventListener('keydown', (event) => {
+        if (event.key === 'Escape' && this.isHaltAlertOpen()) {
+          event.preventDefault();
+          event.stopPropagation();
+          this.dismissHaltAlert();
+          return;
+        }
         if (event.key === 'Escape' && this.isFeaturePanelOpen()) {
           event.preventDefault();
           event.stopPropagation();
@@ -4242,6 +4558,36 @@
       this.setStatus(runtime.statusLock.message, runtime.statusLock.type, { force: true });
     },
 
+    // 自动停机时显示覆盖全屏的高对比度预警；关闭预警只代表用户已看到，不会恢复任务。
+    showHaltAlert(message) {
+      if (!runtime.ui || !runtime.ui.haltAlertBackdrop) return;
+      const text = String(message || '脚本已停止继续投递。').trim();
+      if (runtime.ui.haltAlertMessage) runtime.ui.haltAlertMessage.textContent = text;
+      runtime.ui.haltAlertBackdrop.hidden = false;
+      runtime.ui.root.classList.add('za-halt-alert-open');
+      if (runtime.ui.haltAlertAcknowledge) {
+        setTimeout(() => {
+          if (!this.isHaltAlertOpen()) return;
+          try {
+            runtime.ui.haltAlertAcknowledge.focus({ preventScroll: true });
+          } catch (_) {
+            runtime.ui.haltAlertAcknowledge.focus();
+          }
+        }, 0);
+      }
+    },
+
+    // 允许用户收起预警层，但不清除暂停/停止状态，也不自动恢复任务。
+    dismissHaltAlert() {
+      if (!runtime.ui || !runtime.ui.haltAlertBackdrop) return;
+      runtime.ui.haltAlertBackdrop.hidden = true;
+      runtime.ui.root.classList.remove('za-halt-alert-open');
+    },
+
+    isHaltAlertOpen() {
+      return Boolean(runtime.ui && runtime.ui.haltAlertBackdrop && !runtime.ui.haltAlertBackdrop.hidden);
+    },
+
     // 手动操作或重新启动前解除状态锁。
     unlockStatus() {
       runtime.statusLock = null;
@@ -4321,6 +4667,28 @@
       const rootIsGuarded = runtime.ui.root.classList.contains('za-guarded-page');
       const resumeButtonHidden = runtime.ui.restrictedBannerResume && runtime.ui.restrictedBannerResume.hidden;
 
+      // 列表筛选参数被 BOSS SPA 悄悄删减时，先暂停再让页面继续重绘，避免点击已失效的旧卡片。
+      const listFilterDrift = getActiveJobListFilterDrift(state);
+      if (!guardInfo && listFilterDrift) {
+        const message = '岗位筛选条件发生变化，当前页面已不是本轮冻结的筛选列表；已暂停任务，请恢复原筛选后再继续';
+        logDebugEvent('job_list_filter_drift', {
+          message,
+          drift: listFilterDrift,
+          runState: state,
+        }, 'error', { force: true });
+        Automation.pause(message, {
+          manualResumeRequired: true,
+          resumePhase: state.phase === 'chat' ? 'chat' : 'list',
+          guardKind: 'list_filter_changed',
+          guardInfo: {
+            kind: 'list_filter_changed',
+            title: '岗位筛选条件已变化',
+            message,
+          },
+        });
+        return;
+      }
+
       if (guardInfo) {
         if (state.active) {
           handleAutomationGuardPage('watch', guardInfo);
@@ -4381,9 +4749,7 @@
     refreshDailyDeliveryCount(rows) {
       if (!runtime.ui || !runtime.ui.dailyDeliveryCount) return;
 
-      const recordedCount = countTodayDeliveredRows(Array.isArray(rows) ? rows : runtime.ui.greetedRows);
-      // BOSS 的“今日已与 X 位 BOSS 沟通”提示是平台侧权威计数；本地记录可能会比它少一条。
-      const count = Math.max(recordedCount, loadDailyDeliveryCorrection());
+      const count = getCurrentDailyDeliveryCount(rows);
       const limit = APP.dailyDeliveryLimit;
       if (runtime.ui.dailyDeliveryCountValue) {
         runtime.ui.dailyDeliveryCountValue.textContent = count;
@@ -4392,6 +4758,16 @@
       }
       runtime.ui.dailyDeliveryCount.title = `今日已成功发送 ${count} 条沟通消息，上限 ${limit} 条`;
       runtime.ui.dailyDeliveryCount.setAttribute('aria-label', `今日已投递 ${count} 条，共 ${limit} 条上限`);
+    },
+
+    // 每次确认发送成功后，将顶部“今日已投递”累计数推进一条。
+    // 使用校正值保存累计数，避免平台计数大于本地记录时被 refreshGreetedList 覆盖。
+    recordSuccessfulDelivery() {
+      const previousCount = getCurrentDailyDeliveryCount();
+      const nextCount = Math.min(APP.dailyDeliveryLimit, previousCount + 1);
+      saveDailyDeliveryCorrection(nextCount);
+      this.refreshDailyDeliveryCount();
+      return nextCount;
     },
 
     // 接收到 BOSS 平台侧的当天沟通人数后，保存校正值并立即刷新标题栏计数。
@@ -4492,6 +4868,32 @@
     }).length;
   }
 
+  // 顶部“今日已投递”使用本地成功记录和平台侧校正值中的较大值。
+  // 最大沟通数也必须读取这个值，不能只读取本轮 RunState.sentCount。
+  function getCurrentDailyDeliveryCount(rows) {
+    const sourceRows = Array.isArray(rows)
+      ? rows
+      : runtime.ui && Array.isArray(runtime.ui.greetedRows)
+        ? runtime.ui.greetedRows
+        : [];
+    return Math.max(countTodayDeliveredRows(sourceRows), loadDailyDeliveryCorrection());
+  }
+
+  function getDailyCommunicationLimitStatus() {
+    const maxCount = Number(config.maxCount || 0);
+    const currentCount = getCurrentDailyDeliveryCount();
+    return {
+      maxCount,
+      currentCount,
+      reached: maxCount > 0 && currentCount >= maxCount,
+    };
+  }
+
+  function formatDailyCommunicationLimitMessage(status) {
+    const limit = status || {};
+    return `已达到今日最大沟通数：${limit.maxCount}（当前已投递 ${limit.currentCount} 条）`;
+  }
+
   // 仅接受当天有效的整数校正值，避免旧日期或异常弹窗内容污染标题栏计数。
   function normalizeDailyDeliveryCount(value) {
     const count = Number(value);
@@ -4499,7 +4901,7 @@
     return count;
   }
 
-  // BOSS 平台侧的沟通人数校正只保存当天；跨天后自动丢弃，计数随本地记录重新开始。
+  // 今日累计沟通数只保存当天；平台弹窗同步和本地成功发送都会更新该值，跨天后自动丢弃。
   function loadDailyDeliveryCorrection() {
     try {
       const raw = localStorage.getItem(APP.dailyDeliveryCorrectionKey);
@@ -4717,10 +5119,182 @@
     },
   };
 
+  // 发送系统级停机通知；优先使用用户脚本管理器通知，浏览器通知作为兜底。
+  function notifySystemHalt(message) {
+    const title = `${APP.name}：自动沟通已停止`;
+    const body = String(message || '脚本已停止继续投递。').trim().slice(0, 240);
+    const focusPage = () => {
+      try {
+        if (typeof pageWindow.focus === 'function') pageWindow.focus();
+      } catch (_) {}
+      if (runtime.ui) UI.showHaltAlert(body);
+    };
+
+    try {
+      if (typeof GM_notification === 'function') {
+        GM_notification({
+          title,
+          text: body,
+          timeout: 0,
+          onclick: focusPage,
+        });
+        return true;
+      }
+    } catch (error) {
+      console.warn('[ZhipinAuto] 用户脚本系统通知失败', error);
+    }
+
+    const NotificationApi = pageWindow.Notification
+      || (typeof Notification !== 'undefined' ? Notification : null);
+    if (typeof NotificationApi !== 'function') return false;
+
+    const showBrowserNotification = () => {
+      try {
+        const notification = new NotificationApi(title, {
+          body,
+          tag: 'zhipin-auto-greeting-halt',
+          requireInteraction: true,
+        });
+        notification.onclick = focusPage;
+        return true;
+      } catch (error) {
+        console.warn('[ZhipinAuto] 浏览器系统通知失败', error);
+        return false;
+      }
+    };
+
+    try {
+      if (NotificationApi.permission === 'granted') return showBrowserNotification();
+      if (NotificationApi.permission !== 'default' || runtime.haltNotificationPermissionRequested) return false;
+
+      runtime.haltNotificationPermissionRequested = true;
+      const permissionRequest = typeof NotificationApi.requestPermission === 'function'
+        ? NotificationApi.requestPermission.call(NotificationApi)
+        : null;
+      if (permissionRequest && typeof permissionRequest.then === 'function') {
+        permissionRequest.then((permission) => {
+          if (permission === 'granted') showBrowserNotification();
+        }).catch(() => {});
+      }
+    } catch (error) {
+      console.warn('[ZhipinAuto] 请求浏览器系统通知权限失败', error);
+    }
+    return false;
+  }
+
+  function nextAutomationRunToken() {
+    runtime.automationRunToken = Number(runtime.automationRunToken || 0) + 1;
+    return runtime.automationRunToken;
+  }
+
+  function isCurrentAutomationRun(token) {
+    return Number(token) === Number(runtime.automationRunToken || 0);
+  }
+
+  // 列表 URL 是本轮运行的筛选快照；BOSS 若在运行中删掉 jobType/salary 等参数，
+  // 页面卡片会被重新查询，继续点击会把脚本带到另一批岗位上。
+  function getActiveJobListFilterDrift(state, href) {
+    const currentState = state || RunState.load() || {};
+    if (!currentState.active || currentState.phase === 'returning') return null;
+    const currentHref = href || location.href;
+    if (!isJobListUrl(currentHref) || !currentState.listFilterSignature) return null;
+
+    const expectedSignature = currentState.listFilterSignature;
+    const currentSignature = makeJobListFilterSignature(currentHref);
+    if (expectedSignature === currentSignature) return null;
+
+    return {
+      expectedSignature,
+      currentSignature,
+      expectedUrl: getRestorableListUrl(currentState.listUrl) || currentState.listUrl || '',
+      currentUrl: currentHref,
+    };
+  }
+
+  function createJobListFilterDriftError(state, href) {
+    const drift = getActiveJobListFilterDrift(state, href);
+    if (!drift) return null;
+
+    const error = createPauseError('岗位筛选条件发生变化，当前页面已不是本轮冻结的筛选列表；已暂停任务，请恢复原筛选后再继续');
+    error.zhipinJobListFilterDrift = drift;
+    return error;
+  }
+
+  // 使用 Web Audio API 播放一次短促提示音；浏览器禁止音频时不影响视觉和系统通知。
+  function playHaltDing() {
+    const AudioContextApi = pageWindow.AudioContext || pageWindow.webkitAudioContext;
+    if (typeof AudioContextApi !== 'function') return false;
+
+    try {
+      const context = new AudioContextApi();
+      const playTone = () => {
+        if (!context || context.state === 'closed') return;
+        const oscillator = context.createOscillator();
+        const gain = context.createGain();
+        const startAt = context.currentTime;
+        oscillator.type = 'sine';
+        oscillator.frequency.setValueAtTime(880, startAt);
+        oscillator.frequency.exponentialRampToValueAtTime(660, startAt + 0.24);
+        gain.gain.setValueAtTime(0.0001, startAt);
+        gain.gain.exponentialRampToValueAtTime(0.24, startAt + 0.025);
+        gain.gain.exponentialRampToValueAtTime(0.0001, startAt + 0.34);
+        oscillator.connect(gain);
+        gain.connect(context.destination);
+        oscillator.start(startAt);
+        oscillator.stop(startAt + 0.35);
+        setTimeout(() => {
+          try {
+            if (context.state !== 'closed') context.close();
+          } catch (_) {}
+        }, 700);
+      };
+
+      if (context.state === 'suspended' && typeof context.resume === 'function') {
+        context.resume().then(playTone).catch(() => {
+          try { context.close(); } catch (_) {}
+        });
+      } else {
+        playTone();
+      }
+      return true;
+    } catch (error) {
+      console.warn('[ZhipinAuto] 停机提示音播放失败', error);
+      return false;
+    }
+  }
+
   // 自动化状态机：list -> chat -> returning -> list。
   // list：遍历岗位卡片并点击沟通；chat：在聊天页发送问候；returning：发送后回到岗位列表。
   // BOSS 的沟通按钮会触发页面跳转，状态必须写入 localStorage，脚本重载后才能继续。
   const Automation = {
+    // 每轮自动化只提醒一次，避免同一个异常被多个异步 catch 重复鸣响和弹窗。
+    announceHalt(message, kind) {
+      const text = String(message || '脚本已停止继续投递。').trim();
+      if (runtime.haltAlertShown) {
+        if (runtime.ui && !UI.isHaltAlertOpen()) UI.showHaltAlert(runtime.haltAlertMessage || text);
+        return;
+      }
+
+      runtime.haltAlertShown = true;
+      runtime.haltAlertMessage = text;
+      if (runtime.ui) {
+        UI.showHaltAlert(text);
+      } else {
+        setTimeout(() => {
+          try {
+            const alertFn = pageWindow.alert || (typeof alert === 'function' ? alert : null);
+            if (typeof alertFn === 'function') alertFn.call(pageWindow, `[${APP.name}] ${text}`);
+          } catch (_) {}
+        }, 0);
+      }
+      notifySystemHalt(text);
+      playHaltDing();
+      logDebugEvent('automation_halt_alert', {
+        kind: kind || 'halt',
+        message: text,
+      }, 'error', { force: true });
+    },
+
     // 手动点击“开始”后的入口：校验配置、初始化存储和索引，然后进入列表循环。
     async start() {
       if (runtime.automationLoopActive) return;
@@ -4740,9 +5314,7 @@
       const refreshWindow = getAutoRefreshWindowState();
       if (refreshWindow.count >= refreshWindow.limit) {
         const message = formatAutoRefreshLimitMessage(refreshWindow);
-        RunState.pause(message);
-        UI.setRunning(false);
-        UI.setStatus(message, 'error');
+        this.pause(message);
         logDebugEvent('automation_start_blocked_refresh_limit', {
           refreshWindow,
         }, 'warn', { force: true });
@@ -4750,6 +5322,9 @@
       }
 
       UI.unlockStatus();
+      UI.dismissHaltAlert();
+      runtime.haltAlertShown = false;
+      runtime.haltAlertMessage = '';
       UI.saveFormToConfig();
       const validation = validateConfig();
       if (validation) {
@@ -4814,33 +5389,43 @@
       });
 
       runtime.stopRequested = false;
-      this.runListLoop('start');
+      const runToken = nextAutomationRunToken();
+      this.runListLoop('start', runToken);
     },
 
     // 停止自动化：写入 RunState，并解锁 UI。
     stop(reason, options) {
+      nextAutomationRunToken();
       runtime.stopRequested = true;
       runtime.automationLoopActive = false;
       RunState.stop(reason || '已停止');
       UI.setRunning(false);
       if (options && options.manual) {
+        UI.dismissHaltAlert();
         UI.lockStatus('已停止', 'warn');
       } else {
         UI.unlockStatus();
-        UI.setStatus(reason || '已停止', 'warn');
+        const stopReason = reason || '已停止';
+        UI.setStatus(stopReason, 'warn');
+        this.announceHalt(stopReason, 'stop');
       }
     },
 
     // 暂停自动化：保留当前状态给用户判断，但不再自动继续。
     pause(reason, options) {
+      nextAutomationRunToken();
       runtime.stopRequested = true;
       runtime.automationLoopActive = false;
       UI.unlockStatus();
       const pauseReason = reason || '已暂停';
       const settings = options || {};
       const currentState = RunState.load() || {};
+      // 网络、页面、接口或点击异常都需要人工确认后再恢复，避免用户关闭预警后立即重复启动。
+      const manualResumeRequired = settings.manualResumeRequired == null
+        ? true
+        : Boolean(settings.manualResumeRequired);
       const state = RunState.pause(pauseReason, {
-        manualResumeRequired: Boolean(settings.manualResumeRequired),
+        manualResumeRequired,
         resumePhase: settings.resumePhase || currentState.phase || 'list',
         guardKind: settings.guardKind || '',
       });
@@ -4854,6 +5439,7 @@
         reason: pauseReason,
         runState: state,
       }, 'warn', { force: true });
+      this.announceHalt(pauseReason, 'pause');
     },
 
     // 页面刷新或异常页处理完成后，要求用户明确确认一次，再恢复原阶段。
@@ -4875,6 +5461,7 @@
       const phase = state.manualResumePhase && state.manualResumePhase !== 'paused'
         ? state.manualResumePhase
         : 'list';
+      const runToken = nextAutomationRunToken();
       RunState.patch({
         active: true,
         phase,
@@ -4884,6 +5471,9 @@
         expectedNavigation: null,
         pauseReason: '',
       });
+      runtime.haltAlertShown = false;
+      runtime.haltAlertMessage = '';
+      UI.dismissHaltAlert();
       UI.setAutomationGuardMode(false);
       UI.unlockStatus();
       UI.setStatus('已完成人工确认，正在恢复任务...', 'info');
@@ -4892,17 +5482,42 @@
         previousPauseReason: state.pauseReason,
         previousGuardKind: state.guardKind,
       }, 'warn', { force: true });
-      await this.resumeIfNeeded('manual-resume');
+      await this.resumeIfNeeded('manual-resume', runToken);
     },
 
     // 页面加载、pageshow 或路由切换时调用，根据 RunState 恢复 list/chat/returning 阶段。
-    async resumeIfNeeded(reason) {
+    async resumeIfNeeded(reason, suppliedRunToken) {
+      const runToken = suppliedRunToken == null
+        ? Number(runtime.automationRunToken || 0)
+        : Number(suppliedRunToken);
+      if (!isCurrentAutomationRun(runToken)) return;
       let state = RunState.load();
       if (!state || !state.active || runtime.automationLoopActive || runtime.resumeInProgress) return;
 
       const guardInfo = getBossAutomationGuardInfo();
       if (guardInfo) {
         handleAutomationGuardPage(reason || 'resume', guardInfo);
+        return;
+      }
+
+      const listFilterDrift = getActiveJobListFilterDrift(state);
+      if (listFilterDrift) {
+        const message = '岗位筛选条件发生变化，当前页面已不是本轮冻结的筛选列表；已暂停任务，请恢复原筛选后再继续';
+        this.pause(message, {
+          manualResumeRequired: true,
+          resumePhase: state.phase === 'chat' ? 'chat' : 'list',
+          guardKind: 'list_filter_changed',
+          guardInfo: {
+            kind: 'list_filter_changed',
+            title: '岗位筛选条件已变化',
+            message,
+          },
+        });
+        logDebugEvent('job_list_filter_drift', {
+          reason: reason || 'resume',
+          drift: listFilterDrift,
+          runState: RunState.load(),
+        }, 'error', { force: true });
         return;
       }
 
@@ -5001,12 +5616,12 @@
         if (state.phase === 'returning') {
           runtime.automationLoopActive = true;
           UI.setStatus('正在恢复返回岗位列表...', 'info');
-          await this.completeReturnToList(state, reason || 'returning');
+          await this.completeReturnToList(state, reason || 'returning', runToken);
           return;
         }
 
         if ((state.phase === 'chat' || isChatPage()) && state.pendingJob) {
-          this.continueFromChat(reason);
+          this.continueFromChat(reason, runToken);
           return;
         }
 
@@ -5015,8 +5630,9 @@
           return;
         }
 
-        this.runListLoop(reason);
+        this.runListLoop(reason, runToken);
       } catch (error) {
+        if (!isCurrentAutomationRun(runToken)) return;
         runtime.automationLoopActive = false;
         if (isAutomationInterventionError(error)) {
           this.pause(formatAutomationPauseMessage(error, '页面恢复或网络操作异常'));
@@ -5029,7 +5645,11 @@
     },
 
     // 列表页主循环：按稳定岗位标识处理卡片，直到停止、达到上限或列表结束。
-    async runListLoop(reason) {
+    async runListLoop(reason, suppliedRunToken) {
+      const runToken = suppliedRunToken == null
+        ? Number(runtime.automationRunToken || 0)
+        : Number(suppliedRunToken);
+      if (!isCurrentAutomationRun(runToken)) return;
       if (runtime.automationLoopActive) return;
 
       runtime.automationLoopActive = true;
@@ -5039,28 +5659,38 @@
       try {
         // 列表页先等 DOM 卡片和接口数据都就绪，DOM 负责点击，接口数据负责准确记录岗位字段。
         await waitForElement('li.job-card-box', getWaitTimeout(), '岗位列表');
+        if (!isCurrentAutomationRun(runToken)) return;
+        const initialFilterDrift = createJobListFilterDriftError(RunState.load());
+        if (initialFilterDrift) throw initialFilterDrift;
         // 每次进入/恢复列表循环都复核冻结的求职期望，不能只依赖启动时的 active 类。
         await ensureFrozenJobExpectationContext(RunState.load(), 'list-loop');
+        if (!isCurrentAutomationRun(runToken)) return;
         const apiReady = await JobRepository.waitForApiData(1800);
+        if (!isCurrentAutomationRun(runToken)) return;
         if (!apiReady) {
           throw createPauseError('岗位列表数据加载失败，已暂停任务；请人工检查网络和页面后再继续');
         }
         JobRepository.syncCards();
 
-        while (!runtime.stopRequested) {
+        while (!runtime.stopRequested && isCurrentAutomationRun(runToken)) {
           const state = RunState.load();
           if (!state || !state.active) break;
+          const filterDrift = createJobListFilterDriftError(state);
+          if (filterDrift) throw filterDrift;
 
-          if (Number(config.maxCount) > 0 && Number(state.sentCount || 0) >= Number(config.maxCount)) {
-            this.stop(`已达到最大沟通数：${config.maxCount}`);
+          const dailyCommunicationLimit = getDailyCommunicationLimitStatus();
+          if (dailyCommunicationLimit.reached) {
+            this.stop(formatDailyCommunicationLimitMessage(dailyCommunicationLimit));
             break;
           }
 
-          const processed = await this.processNextCard(state);
+          const processed = await this.processNextCard(state, runToken);
+          if (!isCurrentAutomationRun(runToken)) return;
           if (processed === 'navigating') return;
           if (processed === 'done') {
             // 当前虚拟列表扫完后可整页刷新续跑；达到刷新上限或关闭开关时才真正停止。
-            const refreshed = await this.refreshListAfterExhausted();
+            const refreshed = await this.refreshListAfterExhausted(runToken);
+            if (!isCurrentAutomationRun(runToken)) return;
             if (refreshed) return;
             const latestState = RunState.load();
             if (latestState && latestState.phase === 'paused') break;
@@ -5077,28 +5707,39 @@
                 ? `${skipReason}；等待 ${remainingSeconds} 秒后继续...`
                 : `等待 ${remainingSeconds} 秒后继续...`,
             );
+            if (!isCurrentAutomationRun(runToken)) return;
           } finally {
             if (runtime.lastSkipReason === skipReason) runtime.lastSkipReason = '';
           }
         }
       } catch (error) {
+        if (!isCurrentAutomationRun(runToken)) return;
         if (isAutomationInterventionError(error)) {
           this.pause(formatAutomationPauseMessage(error, '列表页面或自动化操作异常'));
         } else {
           this.fatal(error.message || String(error));
         }
       } finally {
-        runtime.automationLoopActive = false;
-        const state = RunState.load();
-        UI.setRunning(Boolean(state && state.active && !runtime.stopRequested));
+        if (isCurrentAutomationRun(runToken)) {
+          runtime.automationLoopActive = false;
+          const state = RunState.load();
+          UI.setRunning(Boolean(state && state.active && !runtime.stopRequested));
+        }
       }
     },
 
     // 处理下一个未扫描岗位：岗位标识负责去重，滚动窗口只负责提供当前可点击的 DOM 卡片。
-    async processNextCard(state) {
+    async processNextCard(state, suppliedRunToken) {
+      const runToken = suppliedRunToken == null
+        ? Number(runtime.automationRunToken || 0)
+        : Number(suppliedRunToken);
+      if (!isCurrentAutomationRun(runToken)) return 'stale';
       let currentState = state || RunState.load() || {};
+      const initialFilterDrift = createJobListFilterDriftError(currentState);
+      if (initialFilterDrift) throw initialFilterDrift;
       if (!runtime.jobPool.length) {
         const apiReady = await JobRepository.waitForApiData(1200);
+        if (!isCurrentAutomationRun(runToken)) return 'stale';
         if (!apiReady) {
           throw createPauseError('岗位列表接口未加载完成，已暂停任务；请人工检查网络和页面后再继续');
         }
@@ -5107,6 +5748,7 @@
       if (currentState.scanPhase !== 'scanning_down') {
         UI.setStatus('正在向上恢复岗位列表顶部...', 'info');
         const reachedTop = await scanJobListToTop();
+        if (!isCurrentAutomationRun(runToken)) return 'stale';
         if (!reachedTop) {
           throw createPauseError('岗位列表无法正常定位，已暂停任务；请人工检查页面后再继续');
         }
@@ -5118,8 +5760,10 @@
         });
       }
 
-      while (!runtime.stopRequested) {
+      while (!runtime.stopRequested && isCurrentAutomationRun(runToken)) {
         currentState = RunState.load() || currentState;
+        const filterDrift = createJobListFilterDriftError(currentState);
+        if (filterDrift) throw filterDrift;
         const processedKeys = getProcessedJobKeySet(currentState);
         const entries = getVisibleJobScanEntries();
         const discoveredKeys = new Set(entries.map((entry) => entry.key).filter(Boolean));
@@ -5134,6 +5778,7 @@
 
         if (!nextEntry) {
           const loaded = await scrollAndWaitForMore(discoveredKeys);
+          if (!isCurrentAutomationRun(runToken)) return 'stale';
           const latestState = RunState.load() || currentState;
           const noProgressCount = loaded ? 0 : Number(latestState.scanNoProgressCount || 0) + 1;
           RunState.patch(Object.assign({ scanNoProgressCount: noProgressCount }, captureJobListPosition()));
@@ -5198,7 +5843,8 @@
           return 'processed';
         }
 
-        return this.communicateWithCard(card, job, cursorIndex, domInfo);
+        if (!isCurrentAutomationRun(runToken)) return 'stale';
+        return this.communicateWithCard(card, job, cursorIndex, domInfo, runToken);
       }
 
       return 'done';
@@ -5247,9 +5893,20 @@
     },
 
     // 单个岗位的沟通流程：选中卡片、补详情、保存 clicked、点击沟通按钮。
-    async communicateWithCard(card, job, cursorIndex, initialDomInfo) {
+    async communicateWithCard(card, job, cursorIndex, initialDomInfo, suppliedRunToken) {
+      const runToken = suppliedRunToken == null
+        ? Number(runtime.automationRunToken || 0)
+        : Number(suppliedRunToken);
+      if (!isCurrentAutomationRun(runToken)) return 'stale';
       const cardDomInfo = initialDomInfo || extractCardInfo(card);
       const scanKey = getJobScanKey(job, cardDomInfo);
+      const initialFilterDrift = createJobListFilterDriftError(RunState.load());
+      if (initialFilterDrift) throw initialFilterDrift;
+      const initialDailyCommunicationLimit = getDailyCommunicationLimitStatus();
+      if (initialDailyCommunicationLimit.reached) {
+        this.stop(formatDailyCommunicationLimitMessage(initialDailyCommunicationLimit));
+        return 'stopped';
+      }
       UI.setStatus(`选择岗位：${job.jobName || '未知岗位'} / ${job.company || '未知公司'}`, 'info');
       logDebugEvent('communicate_start', {
         cursorIndex,
@@ -5272,9 +5929,15 @@
         detailResourceStartedAt,
         { includeHtml: false, forceApiFetch: true },
       );
+      if (!isCurrentAutomationRun(runToken)) return 'stale';
+      const detailFilterDrift = createJobListFilterDriftError(RunState.load());
+      if (detailFilterDrift) throw detailFilterDrift;
       if (apiDetail) job = mergeJobInfo(job, apiDetail);
       // 接口详情先补全岗位 ID，再等待右侧标题和对应沟通按钮稳定，防止误点上一张卡片的残留按钮。
       const detailReady = await waitForJobCommunicationDetail(job, getWaitTimeout() * 1000);
+      if (!isCurrentAutomationRun(runToken)) return 'stale';
+      const communicationFilterDrift = createJobListFilterDriftError(RunState.load());
+      if (communicationFilterDrift) throw communicationFilterDrift;
       const chatButton = detailReady.chatButton;
       const domDetail = detailReady.detail;
       const buttonText = normalizeText(chatButton.innerText || chatButton.textContent || '');
@@ -5294,6 +5957,7 @@
         });
       }
       job = await enrichBossActiveInfoForFilter(job);
+      if (!isCurrentAutomationRun(runToken)) return 'stale';
       logDebugEvent('job_detail_merged_before_chat', {
         cursorIndex,
         job: summarizeJobForDebug(job),
@@ -5342,6 +6006,9 @@
         detailResourceStartedAt,
         { includeHtml: true, forceApiFetch: true },
       );
+      if (!isCurrentAutomationRun(runToken)) return 'stale';
+      const fullDetailFilterDrift = createJobListFilterDriftError(RunState.load());
+      if (fullDetailFilterDrift) throw fullDetailFilterDrift;
       if (fullDetail) {
         job = mergeJobInfo(job, fullDetail);
       }
@@ -5393,6 +6060,13 @@
 
       // 点击沟通前保存岗位和列表现场；本轮固定的 listUrl 不得被详情或聊天路由覆盖。
       const currentListState = RunState.load() || {};
+      const beforeChatFilterDrift = createJobListFilterDriftError(currentListState);
+      if (beforeChatFilterDrift) throw beforeChatFilterDrift;
+      const beforeChatDailyCommunicationLimit = getDailyCommunicationLimitStatus();
+      if (beforeChatDailyCommunicationLimit.reached) {
+        this.stop(formatDailyCommunicationLimitMessage(beforeChatDailyCommunicationLimit));
+        return 'stopped';
+      }
       const listPosition = captureJobListPosition(job);
       const fixedListUrl = currentListState.listUrl || getRestorableListUrl(location.href) || location.href;
       RunState.patch({
@@ -5413,7 +6087,8 @@
       });
 
       // 完整文档导航会把当前列表页放入 BFCache；先监听 pagehide，避免返回后旧超时器误停新流程。
-      this.watchChatPageTransition(job);
+      this.watchChatPageTransition(job, runToken);
+      if (!isCurrentAutomationRun(runToken)) return 'stale';
       if (!clickElement(chatButton)) {
         throw createPauseError('沟通按钮点击失败，已暂停任务；请人工检查页面后再继续');
       }
@@ -5430,7 +6105,11 @@
 
     // 同时覆盖 SPA 跳转和完整文档导航；pagehide 会在 BFCache 冻结计时器前完成清理。
     // 点击沟通后若出现沟通次数提醒弹窗，会先点确定，避免一直等到聊天页超时。
-    watchChatPageTransition(job) {
+    watchChatPageTransition(job, suppliedRunToken) {
+      const runToken = suppliedRunToken == null
+        ? Number(runtime.automationRunToken || 0)
+        : Number(suppliedRunToken);
+      if (!isCurrentAutomationRun(runToken)) return;
       waitFor(() => {
         const dialog = inspectBossPlatformDialog({ dismissSoft: true });
         if (dialog && dialog.kind === 'hard_limit') {
@@ -5447,6 +6126,7 @@
         resolveOnPageHide: true,
         pageHideResult: 'pagehide',
       }).then((transition) => {
+        if (!isCurrentAutomationRun(runToken)) return;
         logDebugEvent('chat_page_transition_observed', {
           transition,
           href: location.href,
@@ -5458,11 +6138,14 @@
         const latestState = RunState.load();
         if (latestState && latestState.active && latestState.phase === 'chat' && latestState.pendingJob) {
           setTimeout(() => {
+            if (!isCurrentAutomationRun(runToken)) return;
             runtime.automationLoopActive = false;
-            this.continueFromChat('same-page');
+            this.continueFromChat('same-page', runToken);
           }, 0);
         }
       }).catch((error) => {
+        // 暂停/人工恢复后，旧 watcher 只能结束等待，不能再次暂停新一轮任务。
+        if (!isCurrentAutomationRun(runToken)) return;
         const latestState = RunState.load();
         if (error && error.zhipinAutoPause) {
           runtime.automationLoopActive = false;
@@ -5496,7 +6179,11 @@
     },
 
     // 聊天页续跑：从 RunState 恢复 pendingJob，发送问候语，写 sent 记录，再进入 returning。
-    async continueFromChat(reason) {
+    async continueFromChat(reason, suppliedRunToken) {
+      const runToken = suppliedRunToken == null
+        ? Number(runtime.automationRunToken || 0)
+        : Number(suppliedRunToken);
+      if (!isCurrentAutomationRun(runToken)) return;
       if (runtime.automationLoopActive) return;
       runtime.automationLoopActive = true;
       UI.setRunning(true);
@@ -5530,6 +6217,7 @@
           { includeHtml: true, forceApiFetch: true },
         )
           .catch(() => JobRepository.getDetailForJob(pendingJob));
+        if (!isCurrentAutomationRun(runToken)) return;
         if (latestDetail) {
           pendingJob = mergeJobInfo(pendingJob, latestDetail);
         }
@@ -5547,7 +6235,14 @@
           throw createPauseError(formatBossDialogPauseMessage(dialog));
         }
 
+        const beforeSendDailyCommunicationLimit = getDailyCommunicationLimitStatus();
+        if (beforeSendDailyCommunicationLimit.reached) {
+          this.stop(formatDailyCommunicationLimitMessage(beforeSendDailyCommunicationLimit));
+          return;
+        }
+
         const sendResult = await this.sendCurrentWithChatOpenRetries(pendingJob, state);
+        if (!isCurrentAutomationRun(runToken)) return;
         // 只有发送确认通过后才写入 sent，并同步更新已沟通列表。
         const sentRecord = await Database.saveJobRecord(pendingJob, {
           status: 'sent',
@@ -5557,7 +6252,14 @@
           chatButtonText: state.chatButtonText,
           pageUrl: location.href,
         });
+        const previousDailyDeliveryCount = getCurrentDailyDeliveryCount();
+        const dailyDeliveryCount = UI.recordSuccessfulDelivery();
         UI.upsertGreetedRecord(sentRecord);
+        logDebugEvent('daily_delivery_count_increment', {
+          previousCount: previousDailyDeliveryCount,
+          nextCount: dailyDeliveryCount,
+          pendingJob: summarizeJobForDebug(pendingJob),
+        });
 
         const nextDelaySeconds = randomDelaySeconds(config.delayMin, config.delayMax);
         RunState.patch(buildProcessedJobPatch(state, pendingJob, null, {
@@ -5574,14 +6276,20 @@
         }));
 
         await UI.refreshGreetedList({ scrollTop: true });
+        if (!isCurrentAutomationRun(runToken)) return;
         UI.setStatus('发送完成，正在返回岗位列表...', 'ok');
-        await this.completeReturnToList(RunState.load(), reason || 'chat');
+        await this.completeReturnToList(RunState.load(), reason || 'chat', runToken);
       } catch (error) {
+        if (!isCurrentAutomationRun(runToken)) return;
         runtime.automationLoopActive = false;
         if (isAutomationInterventionError(error)) {
           this.pause(formatAutomationPauseMessage(error, '聊天页面、网络或发送操作异常'));
         } else {
           this.fatal(error.message || String(error));
+        }
+      } finally {
+        if (isCurrentAutomationRun(runToken)) {
+          runtime.automationLoopActive = false;
         }
       }
     },
@@ -5612,7 +6320,11 @@
     },
 
     // 发送完成后先尝试历史返回；只有筛选上下文完全一致才算成功，否则恢复固定的原列表 URL。
-    async completeReturnToList(state, reason) {
+    async completeReturnToList(state, reason, suppliedRunToken) {
+      const runToken = suppliedRunToken == null
+        ? Number(runtime.automationRunToken || 0)
+        : Number(suppliedRunToken);
+      if (!isCurrentAutomationRun(runToken)) return false;
       const currentState = state || RunState.load() || {};
       const attempts = Number(currentState.returnAttempts || 0);
       const returnStartedAt = Number(currentState.returnStartedAt || Date.now());
@@ -5636,11 +6348,15 @@
         expectedNavigation: createExpectedNavigation('return', 'list'),
       });
       const navigationResult = await navigateToJobList(currentState);
+      if (!isCurrentAutomationRun(runToken)) return false;
       // 短暂观察返回后是否发生第一页刷新，供后续扫描游标和刷新策略判断。
       await waitForReturnedJobListRefresh(returnStartedAt);
+      if (!isCurrentAutomationRun(runToken)) return false;
       // 恢复滚动位置之前先恢复求职期望，避免在“推荐”列表上按旧岗位锚点继续扫描。
       const expectationResult = await ensureFrozenJobExpectationContext(currentState, 'returning');
+      if (!isCurrentAutomationRun(runToken)) return false;
       await restoreJobListPosition(RunState.load() || currentState);
+      if (!isCurrentAutomationRun(runToken)) return false;
       logDebugEvent('complete_return_list_visible', {
         reason,
         attempts: attempts + 1,
@@ -5677,6 +6393,7 @@
         const beforeResponseSerial = Number(runtime.jobListResponseSerial || 0);
         scrollJobListToTop();
         await waitForJobListRenderChange(beforeRenderSignature, beforeResponseSerial, 600);
+        if (!isCurrentAutomationRun(runToken)) return false;
         JobRepository.syncCards();
         UI.setStatus('检测到岗位列表刷新，已保留已处理岗位并从顶部继续', 'warn');
       } else if (expectationResult.restored) {
@@ -5697,8 +6414,11 @@
 
       runtime.automationLoopActive = false;
       await UI.refreshGreetedList({ scrollTop: true });
+      if (!isCurrentAutomationRun(runToken)) return false;
       await this.waitBeforeNextCommunication();
-      this.runListLoop(`returned:${reason || 'chat'}`);
+      if (!isCurrentAutomationRun(runToken)) return false;
+      this.runListLoop(`returned:${reason || 'chat'}`, runToken);
+      return true;
     },
 
     // 判断返回列表后是否发生了第一页刷新或搜索上下文变化，避免游标指向错误岗位。
@@ -5728,9 +6448,9 @@
     // 两次沟通之间的随机等待，也负责检查最大沟通数上限。
     async waitBeforeNextCommunication() {
       const state = RunState.load() || {};
-      const maxCount = Number(config.maxCount || 0);
-      if (maxCount > 0 && Number(state.sentCount || 0) >= maxCount) {
-        RunState.patch({ nextRunAt: null, nextDelaySeconds: null });
+      const dailyCommunicationLimit = getDailyCommunicationLimitStatus();
+      if (dailyCommunicationLimit.reached) {
+        this.stop(formatDailyCommunicationLimitMessage(dailyCommunicationLimit));
         return;
       }
 
@@ -5749,7 +6469,11 @@
     },
 
     // 当前列表无可沟通岗位时整页刷新续跑；依赖 RunState.active 在刷新后由 resumeIfNeeded 接上。
-    async refreshListAfterExhausted() {
+    async refreshListAfterExhausted(suppliedRunToken) {
+      const runToken = suppliedRunToken == null
+        ? Number(runtime.automationRunToken || 0)
+        : Number(suppliedRunToken);
+      if (!isCurrentAutomationRun(runToken)) return false;
       if (!config.autoRefreshOnExhausted) return false;
 
       const state = RunState.load() || {};
@@ -5792,6 +6516,7 @@
           nextRunAt,
           (remainingSeconds) => `列表已处理完，距离下一次自动刷新还需 ${remainingSeconds} 秒...`,
         );
+        if (!isCurrentAutomationRun(runToken)) return false;
         RunState.patch({ nextRunAt: null, nextDelaySeconds: null });
         if (!completed) return false;
       }
@@ -5845,6 +6570,7 @@
         expectedNavigation: createExpectedNavigation('list_refresh', 'list'),
       });
 
+      if (!isCurrentAutomationRun(runToken)) return false;
       runtime.stopRequested = false;
       location.reload();
       return true;
@@ -5852,6 +6578,7 @@
 
     // 统一停机入口：写停止状态、解锁 UI，并锁定错误提示。
     fatal(message) {
+      nextAutomationRunToken();
       if (runtime.statusLock) {
         runtime.stopRequested = true;
         runtime.automationLoopActive = false;
@@ -5867,7 +6594,7 @@
       RunState.stop(message);
       UI.setRunning(false);
       UI.setStatus(message, 'error');
-      setTimeout(() => alert(`[${APP.name}] ${message}`), 0);
+      this.announceHalt(message, 'fatal');
     },
   };
 
@@ -10340,6 +11067,103 @@
         margin-bottom: 0;
         color: #912018;
       }
+      #zhipin-auto-greeting-root .za-halt-alert-backdrop {
+        position: fixed;
+        inset: 0;
+        z-index: 2147483004;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 24px;
+        background: rgba(69, 10, 10, 0.84);
+        animation: za-halt-alert-backdrop-pulse 1.2s ease-in-out 2;
+      }
+      #zhipin-auto-greeting-root .za-halt-alert-dialog {
+        width: min(760px, calc(100vw - 48px));
+        display: flex;
+        align-items: center;
+        gap: 26px;
+        border: 6px solid #dc2626;
+        border-radius: 20px;
+        padding: 30px 34px;
+        background: #fff;
+        box-shadow: 0 0 0 8px rgba(254, 226, 226, 0.9), 0 24px 80px rgba(0, 0, 0, 0.52);
+      }
+      #zhipin-auto-greeting-root .za-halt-alert-pulse {
+        flex: 0 0 92px;
+        width: 92px;
+        height: 92px;
+        display: grid;
+        place-items: center;
+        border-radius: 50%;
+        background: #dc2626;
+        color: #fff;
+        font-size: 68px;
+        font-weight: 900;
+        line-height: 1;
+        box-shadow: 0 0 0 10px #fee2e2;
+        animation: za-halt-alert-icon-pulse 0.9s ease-in-out infinite;
+      }
+      #zhipin-auto-greeting-root .za-halt-alert-content {
+        min-width: 0;
+        flex: 1 1 auto;
+      }
+      #zhipin-auto-greeting-root .za-halt-alert-kicker {
+        color: #b42318;
+        font-size: 16px;
+        font-weight: 800;
+        letter-spacing: 0.12em;
+      }
+      #zhipin-auto-greeting-root .za-halt-alert-title {
+        margin-top: 4px;
+        color: #7f1d1d;
+        font-size: 32px;
+        font-weight: 900;
+        line-height: 1.2;
+      }
+      #zhipin-auto-greeting-root .za-halt-alert-message {
+        margin-top: 16px;
+        border-left: 8px solid #dc2626;
+        border-radius: 6px;
+        padding: 12px 16px;
+        background: #fef2f2;
+        color: #111827;
+        font-size: 22px;
+        font-weight: 800;
+        line-height: 1.45;
+        overflow-wrap: anywhere;
+        word-break: break-word;
+      }
+      #zhipin-auto-greeting-root .za-halt-alert-hint {
+        margin-top: 14px;
+        color: #4b5563;
+        font-size: 16px;
+        line-height: 1.5;
+      }
+      #zhipin-auto-greeting-root .za-halt-alert-ack {
+        min-height: 50px;
+        margin-top: 20px;
+        border-color: #b91c1c;
+        border-radius: 8px;
+        padding: 0 18px;
+        background: #b91c1c;
+        color: #fff;
+        font-size: 17px;
+        font-weight: 800;
+        box-shadow: 0 5px 0 #7f1d1d;
+      }
+      #zhipin-auto-greeting-root .za-halt-alert-ack:hover,
+      #zhipin-auto-greeting-root .za-halt-alert-ack:focus-visible {
+        background: #991b1b;
+      }
+      @keyframes za-halt-alert-backdrop-pulse {
+        0%, 100% { background: rgba(69, 10, 10, 0.84); }
+        50% { background: rgba(127, 29, 29, 0.94); }
+      }
+      @keyframes za-halt-alert-icon-pulse {
+        0%, 100% { transform: scale(1); box-shadow: 0 0 0 10px #fee2e2; }
+        50% { transform: scale(1.08); box-shadow: 0 0 0 18px #fecaca; }
+      }
       #zhipin-auto-greeting-root .za-section {
         padding: 16px 14px 0;
       }
@@ -11017,6 +11841,37 @@
         }
         #zhipin-auto-greeting-root .za-about-actions button {
           width: 100%;
+        }
+        #zhipin-auto-greeting-root .za-halt-alert-dialog {
+          width: min(760px, calc(100vw - 24px));
+          flex-direction: column;
+          gap: 18px;
+          padding: 24px 18px;
+          text-align: center;
+        }
+        #zhipin-auto-greeting-root .za-halt-alert-pulse {
+          flex-basis: 74px;
+          width: 74px;
+          height: 74px;
+          font-size: 54px;
+        }
+        #zhipin-auto-greeting-root .za-halt-alert-title {
+          font-size: 26px;
+        }
+        #zhipin-auto-greeting-root .za-halt-alert-message {
+          border-left: 0;
+          border-top: 6px solid #dc2626;
+          font-size: 19px;
+          text-align: left;
+        }
+        #zhipin-auto-greeting-root .za-halt-alert-ack {
+          width: 100%;
+        }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        #zhipin-auto-greeting-root .za-halt-alert-backdrop,
+        #zhipin-auto-greeting-root .za-halt-alert-pulse {
+          animation: none;
         }
       }
     `;

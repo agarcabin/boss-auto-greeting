@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BOSS直聘自动沟通助手
 // @namespace    local.codex.zhipin
-// @version      0.1.16
+// @version      0.1.17
 // @description  在 BOSS 直聘搜索结果页自动选择岗位、发送常用语或自定义问候语，并记录岗位数据。
 // @match        https://www.zhipin.com/web/geek/jobs*
 // @match        https://www.zhipin.com/web/geek/chat*
@@ -41,7 +41,7 @@
   // 全局常量：集中维护脚本版本、存储 key、BOSS 接口特征和默认问候语。
   const APP = {
     name: 'BOSS自动沟通',
-    version: '0.1.16',
+    version: '0.1.17',
     githubVersionUrl: 'https://raw.githubusercontent.com/agarcabin/boss-auto-greeting/main/zhipin-auto-greeting.user.js',
     dbName: 'ZhipinAutoGreetingDB',
     dbVersion: 1,
@@ -63,6 +63,7 @@
     defaultGreetingText: '您好，我对这个岗位比较感兴趣，希望可以进一步沟通，谢谢。',
     storageQuotaWarnRatio: 0.9,
     dailyDeliveryLimit: 150,
+    unlimitedDailyCommunicationValue: 140,
   };
 
   // unsafeWindow 是篡改猴注入到页面真实环境的 window；优先用它才能拦截页面自己的 fetch/XHR/history。
@@ -88,7 +89,7 @@
     { id: 'greeting', title: '打招呼配置', defaultEnabled: true, readonly: true },
     { id: 'strategy', title: '运行策略', defaultEnabled: true, readonly: true },
     { id: 'companyFilter', title: '公司筛选', defaultEnabled: true },
-    { id: 'companyBlacklist', title: '公司黑名单', defaultEnabled: true },
+    { id: 'companyBlacklist', title: '岗位与JD黑名单', defaultEnabled: true },
     { id: 'export', title: '数据导出', defaultEnabled: true },
     { id: 'cleanup', title: '数据清理', defaultEnabled: true },
     { id: 'debugLog', title: '调试日志', defaultEnabled: false },
@@ -103,6 +104,7 @@
     panelOpen: true,
     featurePanelOpen: false,
     featureBlocks: createDefaultFeatureBlocks(),
+    sectionCollapsed: createDefaultSectionCollapsed(),
     greetingMode: 'fastReply',
     fastReplyIndex: 0,
     fastReplies: [],
@@ -123,11 +125,11 @@
     autoRefreshOnExhausted: true,
     maxListRefresh: 3,
     delayMin: 4,
-    delayMax: 8,
-    waitTimeout: 5,
+    delayMax: 10,
+    waitTimeout: 10,
     // 旧版字段仅为兼容存储；现在网络/页面/点击异常统一暂停，不自动重试。
     chatOpenRetries: 0,
-    maxCount: 0,
+    maxCount: 140,
     // 岗位名称/薪资过滤和数据维护选项。
     // 名称类筛选统一使用部分匹配；保留字段仅用于兼容旧版配置。
     jobNameFilterMode: 'partial',
@@ -139,8 +141,8 @@
     companyBlacklistValue: '',
     companyBlacklistRules: [],
     jobNameBlacklistMode: 'partial',
-    jobNameBlacklistValue: '双休，工资，急，高薪',
-    jobNameBlacklistRules: ['双休', '工资', '急', '高薪'],
+    jobNameBlacklistValue: '某，双休，工资，急，高薪，合伙，人寿，保险，珍岛，同花顺，掌上',
+    jobNameBlacklistRules: ['某', '双休', '工资', '急', '高薪', '合伙', '人寿', '保险', '珍岛', '同花顺', '掌上'],
     jdBlacklistMode: 'partial',
     jdBlacklistValue: '合伙，押金，保证金，培训费，代理加盟，刷单，垫资',
     jdBlacklistRules: ['合伙', '押金', '保证金', '培训费', '代理加盟', '刷单', '垫资'],
@@ -333,6 +335,7 @@
       .filter((item) => availableKeys.has(normalizeBossActiveText(item)));
     next.featurePanelOpen = Boolean(next.featurePanelOpen);
     next.featureBlocks = normalizeFeatureBlocks(next.featureBlocks);
+    next.sectionCollapsed = normalizeSectionCollapsed(next.sectionCollapsed);
 
     return next;
   }
@@ -355,6 +358,23 @@
   function createDefaultFeatureBlocks() {
     return FEATURE_BLOCK_DEFINITIONS.reduce((output, item) => {
       output[item.id] = item.defaultEnabled !== false;
+      return output;
+    }, {});
+  }
+
+  // 默认展开所有大板块；用户点击后的状态会单独保存，不影响板块显示开关。
+  function createDefaultSectionCollapsed() {
+    return FEATURE_BLOCK_DEFINITIONS.reduce((output, item) => {
+      output[item.id] = false;
+      return output;
+    }, {});
+  }
+
+  // 兼容旧配置，为新增的大板块收起状态补齐默认展开值。
+  function normalizeSectionCollapsed(source) {
+    const raw = source && typeof source === 'object' && !Array.isArray(source) ? source : {};
+    return FEATURE_BLOCK_DEFINITIONS.reduce((output, item) => {
+      output[item.id] = Boolean(raw[item.id]);
       return output;
     }, {});
   }
@@ -3377,7 +3397,7 @@
                 <label>今日最大沟通数<input data-field="maxCount" type="number" min="0" step="1"></label>
                 <label>一小时内刷新上限<input data-field="maxListRefresh" type="number" min="1" max="3" step="1" title="最近一小时内最多自动刷新3次，达到上限后暂停任务"></label>
               </div>
-              <p class="za-hint">今日最大沟通数按顶部“今日已投递”累计数计算；留空或填 0 表示不限制。列表耗尽后等待 60 秒再刷新；最近一小时累计达到 3 次后暂停任务。网络异常、页面加载失败或按钮点击失败时会立即暂停，不会自动重试。</p>
+              <p class="za-hint">今日最大沟通数按顶部“今日已投递”累计数计算；填 140（旧配置填 0 也兼容）表示不限制。列表耗尽后等待 60 秒再刷新；最近一小时累计达到 3 次后暂停任务。网络异常、页面加载失败或按钮点击失败时会立即暂停，不会自动重试。</p>
             </div>
           </section>
 
@@ -3422,11 +3442,11 @@
           </section>
 
           <section class="za-section" data-feature-section="companyBlacklist">
-            <h3>公司黑名单</h3>
+            <h3>岗位与JD黑名单</h3>
             <div class="za-subsection">
-              <div class="za-subsection-title">名称黑名单</div>
+              <div class="za-subsection-title">岗位名称黑名单</div>
               <textarea data-field="jobNameBlacklistValue" rows="2" autocomplete="off" spellcheck="false" placeholder="多个关键词用中文逗号分隔"></textarea>
-              <p class="za-hint">固定部分匹配；匹配公司名称；多个关键词用中文逗号分隔；默认：双休、工资、急、高薪。</p>
+              <p class="za-hint">固定部分匹配；匹配岗位名称；多个关键词用中文逗号分隔；默认：某、双休、工资、急、高薪、合伙、人寿、保险、珍岛、同花顺、掌上。</p>
             </div>
 
             <div class="za-subsection">
@@ -3566,9 +3586,11 @@
       };
 
       this.prepareConfigFields();
+      this.prepareSectionToggles();
       this.renderFeatureBlockControls();
       this.bindEvents();
       this.applyConfigToForm();
+      this.applySectionCollapse();
       this.renderDebugLogControls();
       this.renderFastReplyOptions();
       this.renderBossActiveFilterOptions();
@@ -3602,6 +3624,68 @@
           field.name = `zhipin-auto-${key}`;
         }
       });
+    },
+
+    // 将每个大板块标题转换为原生按钮，支持鼠标和键盘收起/展开。
+    prepareSectionToggles() {
+      if (!runtime.ui || !runtime.ui.root) return;
+
+      runtime.ui.root.querySelectorAll('[data-feature-section] > h3').forEach((heading) => {
+        if (heading.querySelector('[data-action="toggleSection"]')) return;
+
+        const section = heading.parentElement;
+        const sectionId = section && section.dataset.featureSection;
+        const title = normalizeText(heading.textContent);
+        if (!sectionId || !title) return;
+
+        const toggle = document.createElement('button');
+        toggle.type = 'button';
+        toggle.className = 'za-section-toggle';
+        toggle.dataset.action = 'toggleSection';
+        toggle.dataset.sectionId = sectionId;
+        toggle.dataset.sectionTitle = title;
+        toggle.setAttribute('aria-expanded', 'true');
+        toggle.title = `收起${title}`;
+
+        const label = document.createElement('span');
+        label.textContent = title;
+        const icon = document.createElement('span');
+        icon.className = 'za-section-chevron';
+        icon.setAttribute('aria-hidden', 'true');
+        icon.textContent = '▾';
+        toggle.append(label, icon);
+        heading.replaceChildren(toggle);
+      });
+    },
+
+    // 应用已保存的大板块收起状态；隐藏内容但保留标题，方便随时展开。
+    applySectionCollapse() {
+      if (!runtime.ui || !runtime.ui.root) return;
+
+      const collapsed = normalizeSectionCollapsed(config.sectionCollapsed);
+      runtime.ui.root.querySelectorAll('[data-feature-section]').forEach((section) => {
+        const id = section.dataset.featureSection;
+        const isCollapsed = Boolean(collapsed[id]);
+        section.classList.toggle('za-section-collapsed', isCollapsed);
+
+        const toggle = section.querySelector('h3 > [data-action="toggleSection"]');
+        if (!toggle) return;
+        toggle.setAttribute('aria-expanded', isCollapsed ? 'false' : 'true');
+        toggle.title = `${isCollapsed ? '展开' : '收起'}${toggle.dataset.sectionTitle || ''}`;
+        const icon = toggle.querySelector('.za-section-chevron');
+        if (icon) icon.textContent = isCollapsed ? '▸' : '▾';
+      });
+    },
+
+    // 切换单个大板块的收起状态，并持久化到配置。
+    toggleSection(sectionId) {
+      const id = normalizeText(sectionId);
+      if (!FEATURE_BLOCK_ID_SET.has(id)) return;
+
+      const nextCollapsed = normalizeSectionCollapsed(config.sectionCollapsed);
+      nextCollapsed[id] = !nextCollapsed[id];
+      saveConfig({ sectionCollapsed: nextCollapsed });
+      this.applySectionCollapse();
     },
 
     // 部分浏览器会在 DOM 插入后异步恢复旧表单值；用户未触碰前用配置值覆盖回去。
@@ -3645,6 +3729,10 @@
         }
         if (action === 'closeFeaturePanel') {
           this.setFeaturePanelOpen(false);
+          return;
+        }
+        if (action === 'toggleSection') {
+          this.toggleSection(target.dataset.sectionId);
           return;
         }
         if (action === 'toggleFeatureBlock') {
@@ -4595,13 +4683,15 @@
     },
 
     // 切换运行态：禁用启动按钮、启用停止按钮，并锁定会影响流程的配置项。
-    setRunning(running) {
+    // 暂停时可保留停止按钮，让用户先手动结束当前暂停任务，再重新启动。
+    setRunning(running, options) {
       if (!runtime.ui) return;
       runtime.ui.root.classList.toggle('za-running', Boolean(running));
       const start = runtime.ui.root.querySelector('[data-action="start"]');
       const stop = runtime.ui.root.querySelector('[data-action="stop"]');
+      const keepStopEnabled = Boolean(options && options.keepStopEnabled);
       if (start) start.disabled = Boolean(running);
-      if (stop) stop.disabled = !running;
+      if (stop) stop.disabled = !running && !keepStopEnabled;
       this.setRuntimeConfigLocked(Boolean(running));
       this.renderGuardPanel();
     },
@@ -4885,7 +4975,9 @@
     return {
       maxCount,
       currentCount,
-      reached: maxCount > 0 && currentCount >= maxCount,
+      reached: maxCount > 0
+        && maxCount !== APP.unlimitedDailyCommunicationValue
+        && currentCount >= maxCount,
     };
   }
 
@@ -5429,7 +5521,8 @@
         resumePhase: settings.resumePhase || currentState.phase || 'list',
         guardKind: settings.guardKind || '',
       });
-      UI.setRunning(false);
+      // 暂停仍保留停止入口；用户可先手动结束暂停态，再从头启动。
+      UI.setRunning(false, { keepStopEnabled: true });
       const pageBlocked = settings.pageBlocked == null
         ? Boolean(getBossAutomationGuardInfo())
         : Boolean(settings.pageBlocked);
@@ -11185,6 +11278,40 @@
         border-bottom: 1px solid #eef2f6;
         font-size: 14px;
         font-weight: 700;
+      }
+      #zhipin-auto-greeting-root .za-section-toggle {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        width: 100%;
+        min-width: 0;
+        margin: 0;
+        border: 0;
+        padding: 0;
+        background: transparent;
+        color: inherit;
+        font: inherit;
+        line-height: inherit;
+        text-align: left;
+        cursor: pointer;
+      }
+      #zhipin-auto-greeting-root .za-section-toggle:hover {
+        color: var(--za-primary);
+      }
+      #zhipin-auto-greeting-root .za-section-toggle:focus-visible {
+        outline: 2px solid var(--za-primary);
+        outline-offset: 3px;
+        border-radius: 4px;
+      }
+      #zhipin-auto-greeting-root .za-section-chevron {
+        flex: 0 0 auto;
+        margin-left: 8px;
+        color: var(--za-muted);
+        font-size: 16px;
+        line-height: 1;
+      }
+      #zhipin-auto-greeting-root .za-section-collapsed > :not(h3) {
+        display: none;
       }
       #zhipin-auto-greeting-root .za-subsection {
         margin-top: 10px;

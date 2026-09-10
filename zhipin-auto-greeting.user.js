@@ -3242,48 +3242,46 @@
             <div class="za-header-row">
               <div class="za-header-title">
                 <strong>BOSS自动沟通</strong>
-                <span class="za-subtitle">岗位问候自动化</span>
+                <span class="za-daily-count" data-role="dailyDeliveryCount" aria-live="polite">
+                  <span class="za-daily-count-label">今日已投递：</span><strong class="za-daily-count-value" data-role="dailyDeliveryCountValue">0</strong><span class="za-daily-count-limit" data-role="dailyDeliveryCountLimit">/${APP.dailyDeliveryLimit}</span>
+                </span>
               </div>
-              <span class="za-daily-count" data-role="dailyDeliveryCount" aria-live="polite">
-                <span class="za-daily-count-label">今日已投递：</span><strong class="za-daily-count-value" data-role="dailyDeliveryCountValue">0</strong><span class="za-daily-count-limit">/${APP.dailyDeliveryLimit}</span>
-              </span>
-              <div class="za-header-actions">
-                <button class="za-feature-button" type="button" data-action="toggleFeaturePanel" aria-expanded="false" title="板块管理">
-                  板块管理
-                </button>
-                <button class="za-icon-btn" type="button" data-action="toggle" title="收起">×</button>
+              <div class="za-header-stack">
+                <div class="za-control-actions" aria-label="自动沟通控制">
+                  <button type="button" class="za-primary" data-action="start" data-state="enabled">启动</button>
+                  <button type="button" class="za-danger" data-action="stop" data-state="enabled">停止</button>
+                </div>
               </div>
             </div>
-            <div class="za-control-bar" aria-label="自动沟通控制">
-              <div class="za-control-copy">
-                <strong>任务控制</strong>
-                <span>启动后仍可随时停止</span>
-              </div>
-              <div class="za-control-actions">
-                <button type="button" class="za-primary" data-action="start">启动</button>
-                <button type="button" class="za-danger" data-action="stop">停止</button>
-              </div>
+            <div class="za-header-icon-actions" aria-label="面板操作">
+              <button class="za-feature-button za-icon-btn" type="button" data-action="toggleFeaturePanel" aria-expanded="false" aria-label="板块管理" title="板块管理">
+                <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="m4 16.8-.7 3.9 3.9-.7L18.5 8.7l-3.2-3.2L4 16.8Zm12.4-12.4 1.1-1.1a1.8 1.8 0 0 1 2.5 0l.7.7a1.8 1.8 0 0 1 0 2.5l-1.1 1.1-3.2-3.2Z"/></svg>
+              </button>
+              <button class="za-icon-btn" type="button" data-action="toggle" aria-label="收起面板" title="收起面板">
+                <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="m6.7 5.3 12 12-1.4 1.4-12-12 1.4-1.4Zm12 1.4-12 12-1.4-1.4 12-12 1.4 1.4Z"/></svg>
+              </button>
             </div>
           </header>
 
           <div class="za-feature-panel" data-role="featurePanel" hidden>
             <div class="za-feature-panel-head">
               <strong>板块管理</strong>
-              <button class="za-feature-panel-close" type="button" data-action="closeFeaturePanel" title="关闭板块管理" aria-label="关闭板块管理">×</button>
+              <button class="za-feature-panel-close" type="button" data-action="closeFeaturePanel" title="关闭板块管理" aria-label="关闭板块管理"><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="m6.7 5.3 12 12-1.4 1.4-12-12 1.4-1.4Zm12 1.4-12 12-1.4-1.4 12-12 1.4 1.4Z"/></svg></button>
             </div>
             <div class="za-feature-list" data-role="featureBlockList"></div>
           </div>
 
-          <div class="za-status" data-role="status">等待启动</div>
-          <div class="za-guard-panel" data-role="guardPanel" aria-live="polite">
+          <section class="za-monitor-card" data-role="guardPanel" aria-live="polite">
+            <div class="za-realtime-log"><span class="za-realtime-log-label">实时日志：</span><span class="za-status" data-role="status">等待启动</span></div>
             <div class="za-guard-grid">
               <div><span>任务状态</span><strong data-role="guardRunState">待启动</strong></div>
               <div><span>本轮沟通</span><strong data-role="guardSentCount">0</strong></div>
               <div><span>本小时刷新</span><strong data-role="guardRefreshCount">0/3</strong></div>
               <div><span>下次刷新</span><strong data-role="guardNextRefresh">未安排</strong></div>
+              <div><span>已运行时间</span><strong data-role="guardElapsedTime">未开始</strong></div>
+              <div><span>预估剩余时间</span><strong data-role="guardRemainingTime">待估算</strong></div>
             </div>
-            <div class="za-guard-current" data-role="guardCurrentStatus">当前状态：等待启动</div>
-          </div>
+          </section>
           <div class="za-restricted-banner" data-role="restrictedBanner" hidden>
             <div class="za-restricted-title" data-role="restrictedBannerTitle">自动化已暂停</div>
             <div class="za-restricted-message" data-role="restrictedBannerMessage">检测到 BOSS 403 访问限制页，自动沟通已暂停。</div>
@@ -3544,16 +3542,20 @@
       runtime.ui = {
         root,
         panel: root.querySelector('.za-panel'),
+        header: root.querySelector('.za-header'),
         toggle: root.querySelector('.za-toggle'),
         dailyDeliveryCount: root.querySelector('[data-role="dailyDeliveryCount"]'),
         dailyDeliveryCountValue: root.querySelector('[data-role="dailyDeliveryCountValue"]'),
+        dailyDeliveryCountLimit: root.querySelector('[data-role="dailyDeliveryCountLimit"]'),
+        realtimeLog: root.querySelector('.za-realtime-log'),
         status: root.querySelector('[data-role="status"]'),
         guardPanel: root.querySelector('[data-role="guardPanel"]'),
         guardRunState: root.querySelector('[data-role="guardRunState"]'),
         guardSentCount: root.querySelector('[data-role="guardSentCount"]'),
         guardRefreshCount: root.querySelector('[data-role="guardRefreshCount"]'),
         guardNextRefresh: root.querySelector('[data-role="guardNextRefresh"]'),
-        guardCurrentStatus: root.querySelector('[data-role="guardCurrentStatus"]'),
+        guardElapsedTime: root.querySelector('[data-role="guardElapsedTime"]'),
+        guardRemainingTime: root.querySelector('[data-role="guardRemainingTime"]'),
         featurePanel: root.querySelector('[data-role="featurePanel"]'),
         featureButton: root.querySelector('[data-action="toggleFeaturePanel"]'),
         featureBlockList: root.querySelector('[data-role="featureBlockList"]'),
@@ -3593,6 +3595,7 @@
         rowHeight: 66,
       };
 
+      this.observeHeaderHeight();
       this.prepareConfigFields();
       this.prepareSectionToggles();
       this.renderFeatureBlockControls();
@@ -3615,6 +3618,22 @@
 
       if (!getBossAutomationGuardInfo() && (!config.fastReplies || !config.fastReplies.length)) {
         setTimeout(() => FastReplyService.refresh(false), 500);
+      }
+    },
+
+    // 板块管理弹层跟随实际头部高度，避免头部压缩或窄屏时遮住监控卡。
+    observeHeaderHeight() {
+      if (!runtime.ui || !runtime.ui.header) return;
+      const update = () => {
+        const height = Math.max(0, Math.ceil(runtime.ui.header.getBoundingClientRect().height));
+        runtime.ui.root.style.setProperty('--za-header-height', `${height}px`);
+      };
+      update();
+      if (typeof ResizeObserver === 'function') {
+        try {
+          runtime.ui.headerObserver = new ResizeObserver(update);
+          runtime.ui.headerObserver.observe(runtime.ui.header);
+        } catch (_) {}
       }
     },
 
@@ -3663,10 +3682,21 @@
         icon.textContent = '▾';
         toggle.append(label, icon);
         heading.replaceChildren(toggle);
+
+        // 把标题下的内容放进可动画的容器；弹层 backdrop 留在外层，避免影响 fixed 定位。
+        const content = document.createElement('div');
+        content.className = 'za-section-content';
+        const contentInner = document.createElement('div');
+        contentInner.className = 'za-section-content-inner';
+        Array.from(section.children)
+          .filter((child) => child !== heading && !child.classList.contains('za-fast-reply-backdrop'))
+          .forEach((child) => contentInner.appendChild(child));
+        content.appendChild(contentInner);
+        section.appendChild(content);
       });
     },
 
-    // 应用已保存的大板块收起状态；隐藏内容但保留标题，方便随时展开。
+    // 应用已保存的大板块收起状态；内容通过 CSS transition 展开/收起。
     applySectionCollapse() {
       if (!runtime.ui || !runtime.ui.root) return;
 
@@ -3675,6 +3705,30 @@
         const id = section.dataset.featureSection;
         const isCollapsed = Boolean(collapsed[id]);
         section.classList.toggle('za-section-collapsed', isCollapsed);
+
+        const content = Array.from(section.children)
+          .find((child) => child.classList.contains('za-section-content'));
+        if (content) {
+          const nextState = isCollapsed ? 'true' : 'false';
+          const previousState = content.dataset.collapsed;
+          if (previousState !== undefined && previousState !== nextState) {
+            if (content._zaSectionAnimationTimer) {
+              pageWindow.clearTimeout(content._zaSectionAnimationTimer);
+            }
+            const reducedMotion = typeof pageWindow.matchMedia === 'function'
+              && pageWindow.matchMedia('(prefers-reduced-motion: reduce)').matches;
+            if (reducedMotion) {
+              content.classList.remove('za-section-animating');
+            } else {
+              content.classList.add('za-section-animating');
+              content._zaSectionAnimationTimer = pageWindow.setTimeout(() => {
+                content.classList.remove('za-section-animating');
+                content._zaSectionAnimationTimer = null;
+              }, 260);
+            }
+          }
+          content.dataset.collapsed = nextState;
+        }
 
         const toggle = section.querySelector('h3 > [data-action="toggleSection"]');
         if (!toggle) return;
@@ -4160,7 +4214,11 @@
       const debugSection = runtime.ui.root.querySelector('[data-feature-section="debugLog"]');
       if (debugSection && visible) debugSection.hidden = false;
       const startButton = runtime.ui.root.querySelector('[data-action="start"]');
-      if (startButton) startButton.disabled = enabled || Boolean(state.active) || Boolean(state.manualResumeRequired);
+      if (startButton) {
+        const startDisabled = enabled || Boolean(state.active) || Boolean(state.manualResumeRequired);
+        startButton.disabled = startDisabled;
+        startButton.dataset.state = startDisabled ? 'disabled' : 'enabled';
+      }
       this.applyFeatureBlockVisibility();
       this.renderDebugLogControls();
       this.renderGuardPanel();
@@ -4632,9 +4690,7 @@
       if (runtime.statusLock && !(options && options.force)) return;
       runtime.ui.status.textContent = message || '';
       runtime.ui.status.dataset.type = type || 'info';
-      if (runtime.ui.guardCurrentStatus) {
-        runtime.ui.guardCurrentStatus.textContent = `当前状态：${message || '等待启动'}`;
-      }
+      if (runtime.ui.realtimeLog) runtime.ui.realtimeLog.dataset.type = type || 'info';
       this.renderGuardPanel();
     },
 
@@ -4690,16 +4746,21 @@
       runtime.lastSkipReason = '';
     },
 
-    // 切换运行态：禁用启动按钮、启用停止按钮，并锁定会影响流程的配置项。
-    // 暂停时可保留停止按钮，让用户先手动结束当前暂停任务，再重新启动。
+    // 切换运行态：禁用启动按钮；停止按钮始终可用，方便随时结束残留任务。
     setRunning(running, options) {
       if (!runtime.ui) return;
       runtime.ui.root.classList.toggle('za-running', Boolean(running));
       const start = runtime.ui.root.querySelector('[data-action="start"]');
       const stop = runtime.ui.root.querySelector('[data-action="stop"]');
-      const keepStopEnabled = Boolean(options && options.keepStopEnabled);
-      if (start) start.disabled = Boolean(running);
-      if (stop) stop.disabled = !running && !keepStopEnabled;
+      if (start) {
+        start.disabled = Boolean(running);
+        start.dataset.state = running ? 'disabled' : 'enabled';
+      }
+      if (stop) {
+        // 停止必须始终可点；运行中用 selected 状态表达当前任务归属。
+        stop.disabled = false;
+        stop.dataset.state = running ? 'selected' : 'enabled';
+      }
       this.setRuntimeConfigLocked(Boolean(running));
       this.renderGuardPanel();
     },
@@ -4737,9 +4798,39 @@
       if (runtime.ui.guardSentCount) runtime.ui.guardSentCount.textContent = String(Math.max(0, Number(state.sentCount || 0)));
       if (runtime.ui.guardRefreshCount) runtime.ui.guardRefreshCount.textContent = `${refreshWindow.count}/${refreshWindow.limit}`;
       if (runtime.ui.guardNextRefresh) runtime.ui.guardNextRefresh.textContent = nextRefreshLabel;
-      if (runtime.ui.guardCurrentStatus && runtime.ui.status && !runtime.ui.guardCurrentStatus.textContent) {
-        runtime.ui.guardCurrentStatus.textContent = `当前状态：${runtime.ui.status.textContent || '等待启动'}`;
+      const startedAt = Date.parse(state.startedAt || '');
+      const elapsedSeconds = state.active && Number.isFinite(startedAt)
+        ? Math.max(0, Math.floor((Date.now() - startedAt) / 1000))
+        : 0;
+      const currentCount = getCurrentDailyDeliveryCount();
+      const configuredLimit = Number(config.maxCount);
+      const effectiveLimit = Number.isInteger(configuredLimit)
+        && configuredLimit >= 1
+        && configuredLimit < APP.dailyDeliveryLimit
+        && configuredLimit !== APP.unlimitedDailyCommunicationValue
+        ? configuredLimit
+        : APP.dailyDeliveryLimit;
+      const remainingCount = Math.max(0, effectiveLimit - currentCount);
+      const averageSeconds = Math.max(1,
+        ((Number(config.delayMin) || 0) + (Number(config.delayMax) || 0)) / 2 + 8);
+      const remainingSeconds = Math.ceil(remainingCount * averageSeconds);
+      if (runtime.ui.guardElapsedTime) {
+        runtime.ui.guardElapsedTime.textContent = state.active
+          ? this.formatMonitorDuration(elapsedSeconds, '0秒')
+          : '未开始';
       }
+      if (runtime.ui.guardRemainingTime) {
+        runtime.ui.guardRemainingTime.textContent = state.active
+          ? this.formatMonitorDuration(remainingSeconds, '待估算')
+          : '待估算';
+      }
+    },
+
+    formatMonitorDuration(totalSeconds, emptyLabel) {
+      const seconds = Math.max(0, Math.floor(Number(totalSeconds) || 0));
+      if (!seconds && emptyLabel) return emptyLabel;
+      if (seconds < 60) return `${seconds}秒`;
+      return `${Math.floor(seconds / 60)}分${seconds % 60}秒`;
     },
 
     // 运行中每秒刷新倒计时，空闲时降低频率，避免完整诊断日志和状态面板产生持续高开销。
@@ -4848,9 +4939,16 @@
       if (!runtime.ui || !runtime.ui.dailyDeliveryCount) return;
 
       const count = getCurrentDailyDeliveryCount(rows);
-      const limit = APP.dailyDeliveryLimit;
+      const configuredLimit = Number(config.maxCount);
+      const limit = Number.isInteger(configuredLimit)
+        && configuredLimit >= 1
+        && configuredLimit < APP.dailyDeliveryLimit
+        && configuredLimit !== APP.unlimitedDailyCommunicationValue
+        ? configuredLimit
+        : APP.dailyDeliveryLimit;
       if (runtime.ui.dailyDeliveryCountValue) {
         runtime.ui.dailyDeliveryCountValue.textContent = count;
+        if (runtime.ui.dailyDeliveryCountLimit) runtime.ui.dailyDeliveryCountLimit.textContent = `/${limit}`;
       } else {
         runtime.ui.dailyDeliveryCount.textContent = `今日已投递：${count}/${limit}`;
       }
@@ -5922,18 +6020,10 @@
           return 'processed';
         }
 
-        const prefilterTitleCheck = getJobNameBlacklistCheck(job, domInfo.jobName);
-        logDebugEvent('prefilter_title_check', {
-          cursorIndex,
-          blacklist: prefilterTitleCheck.rules.map((rule) => rule.value),
-          candidates: prefilterTitleCheck.candidates,
-          matched: Boolean(prefilterTitleCheck.decision),
-          matchedKeyword: prefilterTitleCheck.decision && prefilterTitleCheck.decision.rule.value,
-          matchedText: prefilterTitleCheck.decision && prefilterTitleCheck.decision.text,
-        });
-        if (prefilterTitleCheck.decision) {
-          await this.skipTextBlacklist(job, cursorIndex, prefilterTitleCheck.decision, domInfo, {
-            kind: 'job_name',
+        const companyNameBlacklistDecision = findJobNameBlacklistMatch(job, domInfo.company);
+        if (companyNameBlacklistDecision) {
+          await this.skipTextBlacklist(job, cursorIndex, companyNameBlacklistDecision, domInfo, {
+            kind: 'company_name',
             title: '名称黑名单',
           });
           return 'processed';
@@ -6074,19 +6164,10 @@
         domDetail: summarizeJobForDebug(domDetail),
       });
 
-      const detailTitleCheck = getJobNameBlacklistCheck(job, domDetail.jobName || cardDomInfo.jobName);
-      logDebugEvent('final_title_check', {
-        cursorIndex,
-        phase: 'detail_ready',
-        blacklist: detailTitleCheck.rules.map((rule) => rule.value),
-        candidates: detailTitleCheck.candidates,
-        matched: Boolean(detailTitleCheck.decision),
-        matchedKeyword: detailTitleCheck.decision && detailTitleCheck.decision.rule.value,
-        matchedText: detailTitleCheck.decision && detailTitleCheck.decision.text,
-      });
-      if (detailTitleCheck.decision) {
-        return this.skipTextBlacklist(job, cursorIndex, detailTitleCheck.decision, cardDomInfo, {
-          kind: 'job_name',
+      const companyNameBlacklistDecision = findJobNameBlacklistMatch(job);
+      if (companyNameBlacklistDecision) {
+        return this.skipTextBlacklist(job, cursorIndex, companyNameBlacklistDecision, cardDomInfo, {
+          kind: 'company_name',
           title: '名称黑名单',
         });
       }
@@ -6136,19 +6217,10 @@
         fullDetail: summarizeJobForDebug(fullDetail),
       });
 
-      const completedTitleCheck = getJobNameBlacklistCheck(job, domDetail.jobName || cardDomInfo.jobName);
-      logDebugEvent('final_title_check', {
-        cursorIndex,
-        phase: 'full_detail',
-        blacklist: completedTitleCheck.rules.map((rule) => rule.value),
-        candidates: completedTitleCheck.candidates,
-        matched: Boolean(completedTitleCheck.decision),
-        matchedKeyword: completedTitleCheck.decision && completedTitleCheck.decision.rule.value,
-        matchedText: completedTitleCheck.decision && completedTitleCheck.decision.text,
-      });
-      if (completedTitleCheck.decision) {
-        return this.skipTextBlacklist(job, cursorIndex, completedTitleCheck.decision, cardDomInfo, {
-          kind: 'job_name',
+      const detailedJobNameBlacklistDecision = findJobNameBlacklistMatch(job);
+      if (detailedJobNameBlacklistDecision) {
+        return this.skipTextBlacklist(job, cursorIndex, detailedJobNameBlacklistDecision, cardDomInfo, {
+          kind: 'company_name',
           title: '名称黑名单',
         });
       }
@@ -6183,24 +6255,6 @@
         )));
         scrollAheadByJobKey(scanKey);
         return 'processed';
-      }
-
-      // 发送前再次读取当前配置和全部岗位名称候选，作为不可绕过的最后一道防线。
-      const beforeClickTitleCheck = getJobNameBlacklistCheck(job, domDetail.jobName || cardDomInfo.jobName);
-      logDebugEvent('final_title_check', {
-        cursorIndex,
-        phase: 'before_click',
-        blacklist: beforeClickTitleCheck.rules.map((rule) => rule.value),
-        candidates: beforeClickTitleCheck.candidates,
-        matched: Boolean(beforeClickTitleCheck.decision),
-        matchedKeyword: beforeClickTitleCheck.decision && beforeClickTitleCheck.decision.rule.value,
-        matchedText: beforeClickTitleCheck.decision && beforeClickTitleCheck.decision.text,
-      });
-      if (beforeClickTitleCheck.decision) {
-        return this.skipTextBlacklist(job, cursorIndex, beforeClickTitleCheck.decision, cardDomInfo, {
-          kind: 'job_name',
-          title: '名称黑名单',
-        });
       }
 
       // 点击沟通前保存岗位和列表现场；本轮固定的 listUrl 不得被详情或聊天路由覆盖。
@@ -9821,7 +9875,7 @@
     target.dispatchEvent(new Ctor('keyup', eventInit));
   }
 
-    // 文本按模式匹配，供岗位名称筛选、岗位名称黑名单和 JD 黑名单共用。
+    // 文本按模式匹配，供岗位名称筛选、公司名称黑名单和 JD 黑名单共用。
   function companyTextMatches(targetText, mode, valueText) {
     const target = normalizeText(targetText);
     const value = normalizeText(valueText);
@@ -9914,31 +9968,13 @@
     return getSalaryFilterDecision(job, fallbackSalary).matched;
   }
 
-  // 收集岗位上可用于黑名单匹配的岗位名称；详情补全后同时覆盖岗位名和职位名。
-  function getJobNameBlacklistCandidates(job, fallbackJobName) {
-    const rawJob = job && job.rawJob || {};
-    const rawDetail = job && job.rawDetail || {};
-    const rawJobInfo = rawDetail.jobInfo || rawDetail.job || {};
+  // 收集岗位上可用于黑名单匹配的公司名，详情补全后会包含全称/简称。
+  function getCompanyMatchCandidates(job, fallbackCompany) {
     const values = [
-      job && job.jobName,
-      job && job.positionName,
-      job && job.title,
-      rawJob.jobName,
-      rawJob.jobTitle,
-      rawJob.positionName,
-      rawJob.name,
-      rawJob.title,
-      rawDetail.jobName,
-      rawDetail.jobTitle,
-      rawDetail.positionName,
-      rawDetail.name,
-      rawDetail.title,
-      rawJobInfo.jobName,
-      rawJobInfo.jobTitle,
-      rawJobInfo.positionName,
-      rawJobInfo.name,
-      rawJobInfo.title,
-      fallbackJobName,
+      job && job.company,
+      job && job.companyFullName,
+      job && job.companyShortName,
+      fallbackCompany,
     ];
     return Array.from(new Set(values.map(normalizeText).filter(Boolean)));
   }
@@ -9987,18 +10023,12 @@
     return null;
   }
 
-  function getJobNameBlacklistCheck(job, fallbackJobName) {
-    const rules = normalizeTextBlacklistRules(config.jobNameBlacklistRules, 'partial');
-    const candidates = getJobNameBlacklistCandidates(job, fallbackJobName);
-    return {
-      rules,
-      candidates,
-      decision: findTextBlacklistMatch(rules, candidates, 'invalid_job_name_blacklist_rule'),
-    };
-  }
-
-  function findJobNameBlacklistMatch(job, fallbackJobName) {
-    return getJobNameBlacklistCheck(job, fallbackJobName).decision;
+  function findJobNameBlacklistMatch(job, fallbackCompany) {
+    return findTextBlacklistMatch(
+      normalizeTextBlacklistRules(config.jobNameBlacklistRules, 'partial'),
+      getCompanyMatchCandidates(job, fallbackCompany),
+      'invalid_company_name_blacklist_rule',
+    );
   }
 
   function findJdBlacklistMatch(job, fallbackDescription) {
@@ -10929,22 +10959,14 @@
     style.textContent = `
       #zhipin-auto-greeting-root {
         --za-width: 430px;
-        --za-bg: #fafafa;
-        --za-surface: #ffffff;
-        --za-border: #bdbdbd;
-        --za-divider: #e0e0e0;
-        --za-text: rgba(0, 0, 0, 0.87);
-        --za-muted: rgba(0, 0, 0, 0.60);
+        --za-bg: #ffffff;
+        --za-border: #d7dde7;
+        --za-text: #1f2937;
+        --za-muted: #667085;
         --za-primary: #00a6a7;
-        --za-primary-dark: #007f80;
-        --za-primary-soft: #e6f7f7;
-        --za-primary-border: #9edcdd;
-        --za-accent: #00a6a7;
-        --za-danger: #d32f2f;
-        --za-success: #388e3c;
-        --za-warning: #f57c00;
+        --za-danger: #d92d20;
         color: var(--za-text);
-        font: 14px/1.5 Roboto, "Noto Sans SC", -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+        font: 13px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
         position: fixed;
         z-index: 2147483000;
         inset: 0 0 auto auto;
@@ -10960,21 +10982,16 @@
         right: 0;
         top: 45%;
         width: 42px;
-        min-width: 42px;
-        max-width: 42px;
         min-height: 88px;
-        padding: 0;
-        border: 0;
+        border: 1px solid var(--za-border);
         border-right: 0;
         border-radius: 8px 0 0 8px;
         background: var(--za-primary);
         color: #fff;
         cursor: pointer;
-        touch-action: manipulation;
         writing-mode: vertical-rl;
         letter-spacing: 0;
-        box-shadow: 0 3px 6px rgba(0, 0, 0, 0.24);
-        transition: background-color 120ms ease, box-shadow 120ms ease;
+        box-shadow: 0 8px 24px rgba(15, 23, 42, 0.14);
       }
       #zhipin-auto-greeting-root .za-panel {
         position: fixed;
@@ -10984,8 +11001,8 @@
         max-width: calc(100vw - 24px);
         height: 100vh;
         background: var(--za-bg);
-        border-left: 1px solid var(--za-divider);
-        box-shadow: -8px 0 20px rgba(0, 0, 0, 0.20);
+        border-left: 1px solid var(--za-border);
+        box-shadow: -12px 0 28px rgba(15, 23, 42, 0.16);
         transform: translateX(100%);
         transition: transform 180ms ease;
         display: flex;
@@ -10995,63 +11012,24 @@
         transform: translateX(0);
       }
       #zhipin-auto-greeting-root.za-open .za-toggle {
-        display: block;
-        right: min(var(--za-width), calc(100vw - 24px));
-        z-index: 11;
-        border-right: 1px solid rgba(255, 255, 255, 0.35);
+        display: none;
       }
-      #zhipin-auto-greeting-root .za-header {
+      #zhipin-auto-greeting-root .za-header,
+      #zhipin-auto-greeting-root .za-footer {
         flex: 0 0 auto;
-        position: sticky;
-        top: 0;
-        z-index: 10;
-        padding: 0 14px;
-        border-bottom: 1px solid var(--za-divider);
-        background: var(--za-surface);
-        color: var(--za-text);
-        box-shadow: 0 2px 6px rgba(0, 0, 0, 0.18);
-      }
-      #zhipin-auto-greeting-root .za-header-row {
-        min-height: 64px;
-        margin: 0 -14px;
-        padding: 0 14px;
+        padding: 12px 14px;
+        border-bottom: 1px solid var(--za-border);
         display: flex;
         align-items: center;
         justify-content: space-between;
         gap: 10px;
-        background: var(--za-primary);
-        color: #fff;
       }
-      #zhipin-auto-greeting-root .za-control-bar {
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        gap: 12px;
-        min-height: 64px;
-        padding: 10px 0;
-        background: var(--za-surface);
-      }
-      #zhipin-auto-greeting-root .za-control-copy {
-        min-width: 0;
-        display: grid;
-        gap: 2px;
-      }
-      #zhipin-auto-greeting-root .za-control-copy strong {
-        color: var(--za-text);
-        font-size: 13px;
-        font-weight: 500;
-      }
-      #zhipin-auto-greeting-root .za-control-copy span {
-        overflow: hidden;
-        color: var(--za-muted);
-        font-size: 11px;
-        text-overflow: ellipsis;
-        white-space: nowrap;
-      }
-      #zhipin-auto-greeting-root .za-control-actions {
-        flex: 0 0 auto;
-        display: flex;
-        gap: 8px;
+      #zhipin-auto-greeting-root .za-header {
+        position: sticky;
+        top: 0;
+        z-index: 3;
+        background: var(--za-bg);
+        box-shadow: 0 1px 0 rgba(215, 221, 231, 0.85);
       }
       #zhipin-auto-greeting-root .za-header-title {
         flex: 1 1 auto;
@@ -11063,23 +11041,17 @@
         text-overflow: ellipsis;
         white-space: nowrap;
       }
-      #zhipin-auto-greeting-root .za-header-title strong {
-        color: #fff;
-        font-size: 15px;
-        font-weight: 500;
-      }
       #zhipin-auto-greeting-root .za-daily-count {
         flex: 0 0 auto;
-        color: rgba(255, 255, 255, 0.82);
+        color: #101828;
         font-size: 12px;
         font-weight: 400;
         line-height: 1.4;
         white-space: nowrap;
       }
       #zhipin-auto-greeting-root .za-daily-count-value {
-        color: #fff;
+        color: var(--za-primary);
         font-weight: 700;
-        font-variant-numeric: tabular-nums;
       }
       #zhipin-auto-greeting-root .za-salary-unknown-action {
         margin-top: 10px;
@@ -11088,22 +11060,13 @@
         display: block;
         margin-top: 5px;
       }
-      #zhipin-auto-greeting-root .za-header-actions {
-        flex: 0 0 auto;
-        display: flex;
-        align-items: center;
-        gap: 6px;
-      }
-      #zhipin-auto-greeting-root .za-header .za-feature-button,
-      #zhipin-auto-greeting-root .za-header .za-icon-btn {
-        border-color: rgba(255, 255, 255, 0.48);
-        background: transparent;
-        color: #fff;
-        box-shadow: none;
+      #zhipin-auto-greeting-root .za-footer {
+        border-top: 1px solid var(--za-border);
+        border-bottom: 0;
       }
       #zhipin-auto-greeting-root .za-subtitle {
         display: block;
-        color: rgba(255, 255, 255, 0.72);
+        color: var(--za-muted);
         font-size: 12px;
       }
       #zhipin-auto-greeting-root .za-icon-btn {
@@ -11113,10 +11076,9 @@
         width: 28px;
         height: 28px;
         padding: 0;
-        border: 1px solid rgba(255, 255, 255, 0.48);
+        border: 1px solid var(--za-border);
         border-radius: 6px;
-        background: transparent;
-        color: #fff;
+        background: #fff;
         cursor: pointer;
         font-size: 18px;
         line-height: 1;
@@ -11130,16 +11092,16 @@
       }
       #zhipin-auto-greeting-root .za-feature-panel {
         position: fixed;
-        top: 128px;
+        top: 58px;
         right: 14px;
         z-index: 4;
         width: calc(var(--za-width) - 28px);
         max-width: calc(100vw - 52px);
         padding: 10px;
-        border: 1px solid var(--za-divider);
-        border-radius: 2px;
-        background: var(--za-surface);
-        box-shadow: 0 8px 16px rgba(0, 0, 0, 0.24);
+        border: 1px solid var(--za-border);
+        border-radius: 8px;
+        background: #fff;
+        box-shadow: 0 18px 48px rgba(15, 23, 42, 0.22);
       }
       #zhipin-auto-greeting-root .za-feature-panel-head {
         display: flex;
@@ -11184,9 +11146,9 @@
         white-space: nowrap;
       }
       #zhipin-auto-greeting-root .za-feature-switch.za-enabled {
-        border-color: var(--za-primary-border);
-        background: var(--za-primary-soft);
-        color: var(--za-primary-dark);
+        border-color: #b7e4e5;
+        background: #ecfeff;
+        color: #007f80;
       }
       #zhipin-auto-greeting-root .za-feature-switch.za-readonly {
         border-style: dashed;
@@ -11197,45 +11159,46 @@
         font-size: 12px;
       }
       #zhipin-auto-greeting-root .za-feature-switch.za-enabled .za-feature-state {
-        color: var(--za-primary);
+        color: #007f80;
       }
       #zhipin-auto-greeting-root .za-status {
         flex: 0 0 auto;
-        position: relative;
-        margin: 14px 12px 0;
-        padding: 10px 12px;
-        border-left: 4px solid var(--za-primary);
-        border-radius: 2px;
-        background: var(--za-surface);
-        box-shadow: 0 2px 4px rgba(0, 0, 0, 0.16);
-        color: var(--za-text);
+        position: sticky;
+        top: 73px;
+        z-index: 2;
+        margin: 12px 14px 0;
+        padding: 9px 10px;
+        border: 1px solid #d7dde7;
+        border-radius: 6px;
+        background: #eef2f6;
+        box-shadow: 0 0 0 14px var(--za-bg), 0 10px 18px rgba(15, 23, 42, 0.08);
+        color: #344054;
         word-break: break-word;
       }
       #zhipin-auto-greeting-root .za-status[data-type="ok"] {
-        background: #edf7ed;
-        border-left-color: var(--za-success);
-        color: #2e7d32;
+        background: #ecfdf3;
+        border-color: #abefc6;
+        color: #027a48;
       }
       #zhipin-auto-greeting-root .za-status[data-type="warn"] {
-        background: #fff8e1;
-        border-left-color: var(--za-warning);
-        color: #e65100;
+        background: #fffaeb;
+        border-color: #fedf89;
+        color: #b54708;
       }
       #zhipin-auto-greeting-root .za-status[data-type="error"] {
-        background: #ffebee;
-        border-left-color: var(--za-danger);
-        color: #c62828;
+        background: #fef3f2;
+        border-color: #fecdca;
+        color: #b42318;
       }
       #zhipin-auto-greeting-root .za-guard-panel {
         flex: 0 0 auto;
-        margin: 10px 12px 0;
-        padding: 10px 12px;
-        border: 1px solid var(--za-divider);
-        border-radius: 2px;
-        background: var(--za-surface);
-        color: var(--za-muted);
+        margin: 8px 14px 0;
+        padding: 8px 10px;
+        border: 1px solid #e4e7ec;
+        border-radius: 7px;
+        background: #fbfcfd;
+        color: #475467;
         font-size: 11px;
-        box-shadow: 0 1px 3px rgba(0, 0, 0, 0.12);
       }
       #zhipin-auto-greeting-root .za-guard-grid {
         display: grid;
@@ -11250,33 +11213,23 @@
         min-width: 0;
       }
       #zhipin-auto-greeting-root .za-guard-grid span {
-        color: var(--za-muted);
+        color: #667085;
         white-space: nowrap;
       }
       #zhipin-auto-greeting-root .za-guard-grid strong {
         min-width: 0;
         overflow: hidden;
-        color: var(--za-text);
+        color: #344054;
         font-weight: 600;
         text-align: right;
         text-overflow: ellipsis;
         white-space: nowrap;
       }
-      #zhipin-auto-greeting-root .za-guard-current {
-        margin-top: 6px;
-        padding-top: 6px;
-        border-top: 1px solid var(--za-divider);
-        overflow: hidden;
-        color: var(--za-muted);
-        line-height: 1.45;
-        text-overflow: ellipsis;
-        white-space: nowrap;
-      }
       #zhipin-auto-greeting-root .za-restricted-banner {
         flex: 0 0 auto;
-        margin: 12px;
+        margin: 12px 14px 0;
         padding: 12px;
-        border: 1px solid #ef9a9a;
+        border: 1px solid #fecdca;
         border-radius: 8px;
         background: #fff7f6;
         color: #7a271a;
@@ -11374,7 +11327,7 @@
         min-height: 50px;
         margin-top: 20px;
         border-color: #b91c1c;
-        border-radius: 2px;
+        border-radius: 8px;
         padding: 0 18px;
         background: #b91c1c;
         color: #fff;
@@ -11395,33 +11348,26 @@
         50% { transform: scale(1.08); box-shadow: 0 0 0 18px #fecaca; }
       }
       #zhipin-auto-greeting-root .za-section {
-        margin: 12px 12px 0;
-        padding: 16px 14px;
-        border: 1px solid var(--za-divider);
-        border-radius: 2px;
-        background: var(--za-surface);
-        box-shadow: 0 2px 4px rgba(0, 0, 0, 0.14);
+        padding: 16px 14px 0;
       }
       #zhipin-auto-greeting-root .za-section + .za-section {
-        margin-top: 12px;
+        padding-top: 18px;
       }
       #zhipin-auto-greeting-root .za-status + .za-section {
-        margin-top: 12px;
+        padding-top: 20px;
       }
       #zhipin-auto-greeting-root .za-panel {
         overflow-y: auto;
-        padding-bottom: 16px;
       }
       #zhipin-auto-greeting-root h3 {
         display: flex;
         align-items: center;
         gap: 8px;
         margin: 0;
-        padding-bottom: 10px;
-        border-bottom: 1px solid var(--za-divider);
-        color: var(--za-primary-dark);
-        font-size: 15px;
-        font-weight: 500;
+        padding-bottom: 8px;
+        border-bottom: 1px solid #eef2f6;
+        font-size: 14px;
+        font-weight: 700;
       }
       #zhipin-auto-greeting-root .za-section-toggle {
         display: flex;
@@ -11429,10 +11375,8 @@
         justify-content: space-between;
         width: 100%;
         min-width: 0;
-        min-height: 0;
         margin: 0;
         border: 0;
-        border-radius: 0;
         padding: 0;
         background: transparent;
         color: inherit;
@@ -11440,7 +11384,6 @@
         line-height: inherit;
         text-align: left;
         cursor: pointer;
-        box-shadow: none;
       }
       #zhipin-auto-greeting-root .za-section-toggle:hover {
         color: var(--za-primary);
@@ -11457,24 +11400,24 @@
         font-size: 16px;
         line-height: 1;
       }
-      #zhipin-auto-greeting-root .za-section-collapsed > :not(h3) {
+      #zhipin-auto-greeting-root .za-section-collapsed > :not(h3):not(.za-section-content) {
         display: none;
       }
       #zhipin-auto-greeting-root .za-subsection {
-        margin-top: 12px;
-        padding: 12px;
-        border: 1px solid var(--za-divider);
-        border-radius: 2px;
-        background: #fafafa;
+        margin-top: 10px;
+        padding: 10px;
+        border: 1px solid #e5e9f0;
+        border-radius: 8px;
+        background: #fbfcfd;
       }
       #zhipin-auto-greeting-root .za-subsection + .za-subsection {
-        margin-top: 12px;
+        margin-top: 10px;
       }
       #zhipin-auto-greeting-root .za-subsection-title {
-        margin-bottom: 10px;
-        color: var(--za-text);
+        margin-bottom: 8px;
+        color: #344054;
         font-size: 12px;
-        font-weight: 500;
+        font-weight: 700;
         letter-spacing: 0.02em;
       }
       #zhipin-auto-greeting-root .za-subsection > :first-child {
@@ -11491,11 +11434,11 @@
       #zhipin-auto-greeting-root select,
       #zhipin-auto-greeting-root textarea {
         width: 100%;
-        min-height: 40px;
-        border: 1px solid #9e9e9e;
-        border-radius: 4px;
-        padding: 8px 10px;
-        background: var(--za-surface);
+        min-height: 32px;
+        border: 1px solid var(--za-border);
+        border-radius: 6px;
+        padding: 6px 8px;
+        background: #fff;
         color: var(--za-text);
         font: inherit;
       }
@@ -11514,32 +11457,19 @@
       #zhipin-auto-greeting-root select[data-field="exportType"]:focus,
       #zhipin-auto-greeting-root select[data-field="exportType"]:focus-visible {
         outline: none;
-        box-shadow: 0 0 0 2px rgba(0, 166, 167, 0.16);
-        border-color: var(--za-primary);
+        box-shadow: none;
+        border-color: var(--za-border);
       }
       #zhipin-auto-greeting-root button {
-        min-height: 36px;
-        min-width: 64px;
-        border: 1px solid rgba(0, 0, 0, 0.38);
-        border-radius: 4px;
-        padding: 0 16px;
-        background: var(--za-surface);
+        min-height: 32px;
+        border: 1px solid var(--za-border);
+        border-radius: 6px;
+        padding: 0 10px;
+        background: #fff;
         color: var(--za-text);
         cursor: pointer;
         font: inherit;
         white-space: nowrap;
-        box-shadow: none;
-        transition: background-color 120ms ease, box-shadow 120ms ease, border-color 120ms ease;
-      }
-      #zhipin-auto-greeting-root button:hover:not(:disabled) {
-        background: rgba(0, 166, 167, 0.08);
-      }
-      #zhipin-auto-greeting-root button:active:not(:disabled) {
-        background: rgba(0, 166, 167, 0.16);
-      }
-      #zhipin-auto-greeting-root button:focus-visible {
-        outline: 2px solid var(--za-primary);
-        outline-offset: 2px;
       }
       #zhipin-auto-greeting-root button:disabled {
         opacity: 0.55;
@@ -11552,35 +11482,20 @@
         opacity: 0.72;
         background: #f3f4f6;
       }
-      #zhipin-auto-greeting-root input:focus,
-      #zhipin-auto-greeting-root select:focus,
-      #zhipin-auto-greeting-root textarea:focus {
-        outline: none;
-        border-color: var(--za-primary);
-        box-shadow: 0 0 0 2px rgba(0, 166, 167, 0.16);
-      }
       #zhipin-auto-greeting-root .za-primary {
         background: var(--za-primary);
         border-color: var(--za-primary);
         color: #fff;
-        box-shadow: 0 2px 2px rgba(0, 0, 0, 0.24);
+        flex: 1;
       }
       #zhipin-auto-greeting-root .za-danger {
-        background: var(--za-surface);
-        border-color: var(--za-danger);
+        background: #fff;
+        border-color: #fecdca;
         color: var(--za-danger);
-      }
-      #zhipin-auto-greeting-root .za-control-actions .za-primary {
-        box-shadow: 0 2px 4px rgba(0, 0, 0, 0.24);
-      }
-      #zhipin-auto-greeting-root .za-control-actions .za-danger {
-        border-color: var(--za-danger);
-        background: transparent;
-        color: var(--za-danger);
-        box-shadow: none;
+        flex: 1;
       }
       #zhipin-auto-greeting-root .za-danger-soft {
-        border-color: #ef9a9a;
+        border-color: #fecdca;
         color: var(--za-danger);
       }
       #zhipin-auto-greeting-root .za-cleanup-time {
@@ -11602,9 +11517,9 @@
         gap: 6px;
         margin-bottom: 10px;
         padding: 3px;
-        border: 1px solid var(--za-divider);
-        border-radius: 2px;
-        background: #f5f5f5;
+        border: 1px solid var(--za-border);
+        border-radius: 6px;
+        background: #f8fafc;
       }
       #zhipin-auto-greeting-root .za-segment label {
         display: flex;
@@ -11617,9 +11532,9 @@
         cursor: pointer;
       }
       #zhipin-auto-greeting-root .za-segment label:has(input:checked) {
-        background: var(--za-surface);
-        border: 1px solid var(--za-primary-border);
-        color: var(--za-primary-dark);
+        background: #fff;
+        border: 1px solid #b7e4e5;
+        color: #007f80;
       }
       #zhipin-auto-greeting-root .za-source-block {
         margin-bottom: 8px;
@@ -11678,15 +11593,15 @@
         border: 1px solid var(--za-border);
         border-radius: 6px;
         padding: 8px;
-        background: #fafafa;
-        color: var(--za-text);
+        background: #fbfcfd;
+        color: #344054;
         white-space: pre-wrap;
         overflow-wrap: anywhere;
         word-break: break-word;
       }
       #zhipin-auto-greeting-root .za-fast-reply-preview[data-empty="true"] {
         color: var(--za-muted);
-        background: #f5f5f5;
+        background: #f8fafc;
       }
       #zhipin-auto-greeting-root .za-fast-reply-backdrop {
         position: fixed;
@@ -11700,7 +11615,7 @@
         align-items: flex-start;
         justify-content: center;
         padding: 82px 14px 14px;
-        background: rgba(0, 0, 0, 0.32);
+        background: rgba(15, 23, 42, 0.18);
       }
       #zhipin-auto-greeting-root .za-fast-reply-dialog {
         width: 100%;
@@ -11711,7 +11626,7 @@
         border: 1px solid var(--za-border);
         border-radius: 8px;
         background: #fff;
-        box-shadow: 0 8px 24px rgba(0, 0, 0, 0.24);
+        box-shadow: 0 18px 48px rgba(15, 23, 42, 0.24);
       }
       #zhipin-auto-greeting-root .za-fast-reply-head {
         flex: 0 0 auto;
@@ -11736,7 +11651,7 @@
         grid-template-columns: minmax(0, 1fr) auto;
         gap: 8px;
         padding: 10px 12px;
-        border-bottom: 1px solid var(--za-divider);
+        border-bottom: 1px solid #eef2f6;
       }
       #zhipin-auto-greeting-root .za-fast-reply-list {
         flex: 1 1 auto;
@@ -11759,11 +11674,11 @@
       }
       #zhipin-auto-greeting-root .za-fast-reply-option:hover {
         border-color: #e4e7ec;
-        background: #f5f5f5;
+        background: #f8fafc;
       }
       #zhipin-auto-greeting-root .za-fast-reply-option.za-selected {
-        border-color: var(--za-primary-border);
-        background: var(--za-primary-soft);
+        border-color: #b7e4e5;
+        background: #ecfeff;
       }
       #zhipin-auto-greeting-root .za-fast-reply-option-meta {
         display: flex;
@@ -11776,7 +11691,7 @@
       }
       #zhipin-auto-greeting-root .za-fast-reply-selected-mark {
         flex: 0 0 auto;
-        color: var(--za-primary);
+        color: #007f80;
       }
       #zhipin-auto-greeting-root .za-fast-reply-option-text {
         display: block;
@@ -11799,7 +11714,7 @@
         border: 1px solid var(--za-border);
         border-radius: 6px;
         padding: 5px;
-        background: #fafafa;
+        background: #fbfcfd;
       }
       #zhipin-auto-greeting-root .za-multi-dropdown {
         position: relative;
@@ -11837,7 +11752,7 @@
         border-radius: 6px;
         padding: 4px;
         background: #fff;
-        box-shadow: 0 4px 12px rgba(0, 0, 0, 0.18);
+        box-shadow: 0 8px 20px rgba(15, 23, 42, 0.12);
       }
       #zhipin-auto-greeting-root .za-multi-option {
         display: flex;
@@ -11850,7 +11765,7 @@
         cursor: pointer;
       }
       #zhipin-auto-greeting-root .za-multi-option:hover {
-        background: #f5f5f5;
+        background: #f8fafc;
       }
       #zhipin-auto-greeting-root .za-multi-option span {
         min-width: 0;
@@ -11876,12 +11791,10 @@
         width: 24px;
         min-height: 24px;
         border: 0;
-        border-radius: 50%;
         padding: 0;
         background: transparent;
         color: var(--za-muted);
         line-height: 1;
-        box-shadow: none;
       }
       #zhipin-auto-greeting-root .za-blacklist-delete:hover {
         color: #b91c1c;
@@ -11906,18 +11819,17 @@
         align-items: center;
         gap: 4px;
         max-width: 100%;
-        min-height: 32px;
-        border: 1px solid rgba(0, 0, 0, 0.12);
-        border-radius: 16px;
-        padding: 4px 4px 4px 12px;
-        background: #f5f5f5;
+        min-height: 24px;
+        border: 1px solid var(--za-border);
+        border-radius: 6px;
+        padding: 2px 3px 2px 8px;
+        background: #f8fafc;
         color: var(--za-text);
-        box-shadow: none;
       }
       #zhipin-auto-greeting-root .za-selected-chip {
-        background: var(--za-primary-soft);
-        border-color: var(--za-primary-border);
-        color: var(--za-primary-dark);
+        background: #ecfeff;
+        border-color: #b7e4e5;
+        color: #007f80;
       }
       #zhipin-auto-greeting-root .za-selected-chip > span,
       #zhipin-auto-greeting-root .za-option-chip > span {
@@ -11927,26 +11839,13 @@
       }
       #zhipin-auto-greeting-root .za-selected-chip button,
       #zhipin-auto-greeting-root .za-option-chip button {
-        display: inline-flex;
-        align-items: center;
-        justify-content: center;
-        width: 24px;
-        min-width: 24px;
-        min-height: 24px;
+        width: 22px;
+        min-height: 22px;
         border: 0;
-        border-radius: 50%;
         padding: 0;
         background: transparent;
         color: var(--za-muted);
-        font-size: 18px;
         line-height: 1;
-        box-shadow: none;
-      }
-      #zhipin-auto-greeting-root .za-selected-chip button:hover:not(:disabled),
-      #zhipin-auto-greeting-root .za-option-chip button:hover:not(:disabled) {
-        background: rgba(0, 166, 167, 0.12);
-        color: var(--za-primary-dark);
-        box-shadow: none;
       }
       #zhipin-auto-greeting-root .za-empty-text {
         color: var(--za-muted);
@@ -12007,9 +11906,9 @@
         gap: 8px;
         margin-top: 10px;
         padding: 10px;
-        border: 1px solid var(--za-divider);
+        border: 1px solid #e5e9f0;
         border-radius: 8px;
-        background: #fafafa;
+        background: #fbfcfd;
       }
       #zhipin-auto-greeting-root .za-about-row {
         display: flex;
@@ -12031,7 +11930,7 @@
         justify-content: space-between;
         gap: 8px;
         padding-top: 8px;
-        border-top: 1px solid var(--za-divider);
+        border-top: 1px solid #e5e9f0;
       }
       #zhipin-auto-greeting-root .za-about-status {
         min-width: 0;
@@ -12049,7 +11948,7 @@
         color: #b42318;
       }
       #zhipin-auto-greeting-root .za-about-link {
-        color: var(--za-primary);
+        color: #007f80;
         font-size: 12px;
         text-decoration: none;
       }
@@ -12062,7 +11961,7 @@
         border: 1px solid var(--za-border);
         border-radius: 6px;
         overflow-y: auto;
-        background: #fafafa;
+        background: #fbfcfd;
       }
       #zhipin-auto-greeting-root .za-list-spacer {
         width: 1px;
@@ -12077,7 +11976,7 @@
         right: 0;
         height: 66px;
         padding: 8px 10px;
-        border-bottom: 1px solid var(--za-divider);
+        border-bottom: 1px solid #eef2f6;
         overflow: hidden;
       }
       #zhipin-auto-greeting-root .za-list-row strong,
@@ -12099,14 +11998,14 @@
         align-items: center;
         justify-content: center;
         padding: 16px;
-        background: rgba(0, 0, 0, 0.42);
+        background: rgba(15, 23, 42, 0.34);
       }
       #zhipin-auto-greeting-root .za-confirm-dialog {
         width: min(360px, calc(100vw - 32px));
         border: 1px solid var(--za-border);
         border-radius: 8px;
         background: #fff;
-        box-shadow: 0 8px 24px rgba(0, 0, 0, 0.24);
+        box-shadow: 0 18px 48px rgba(15, 23, 42, 0.24);
         padding: 16px;
       }
       #zhipin-auto-greeting-root .za-confirm-title {
@@ -12115,7 +12014,7 @@
         margin-bottom: 8px;
       }
       #zhipin-auto-greeting-root .za-confirm-message {
-        color: var(--za-text);
+        color: #344054;
         white-space: pre-wrap;
         word-break: break-word;
       }
@@ -12129,7 +12028,8 @@
         #zhipin-auto-greeting-root {
           --za-width: min(430px, 100vw);
         }
-        #zhipin-auto-greeting-root .za-header {
+        #zhipin-auto-greeting-root .za-header,
+        #zhipin-auto-greeting-root .za-footer {
           padding-left: 10px;
           padding-right: 10px;
         }
@@ -12185,7 +12085,393 @@
           width: 100%;
         }
       }
+      /* 当前紧凑面板：头部、监控卡和设置大标题保持同一套层级。 */
+      #zhipin-auto-greeting-root .za-header {
+        flex: 0 0 auto;
+        position: sticky;
+        top: 0;
+        z-index: 10;
+        padding: 0;
+        border-bottom: 1px solid var(--za-divider, var(--za-border));
+        background: var(--za-primary);
+        color: #fff;
+        box-shadow: 0 2px 6px rgba(0, 0, 0, 0.18);
+      }
+      #zhipin-auto-greeting-root .za-header-row {
+        min-height: 64px;
+        margin: 0;
+        padding: 4px 100px 4px 14px;
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) auto;
+        align-items: center;
+        gap: 10px;
+        background: var(--za-primary);
+        color: #fff;
+      }
+      #zhipin-auto-greeting-root .za-header-title {
+        flex: 1 1 auto;
+        min-width: 0;
+      }
+      #zhipin-auto-greeting-root .za-header-title strong,
+      #zhipin-auto-greeting-root .za-header-title span {
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      #zhipin-auto-greeting-root .za-header-title > strong {
+        display: block;
+        color: #fff;
+        font-size: 16px;
+        font-weight: 700;
+        line-height: 1.25;
+      }
+      #zhipin-auto-greeting-root .za-daily-count {
+        display: block;
+        max-width: 100%;
+        overflow: hidden;
+        color: rgba(255, 255, 255, 0.84);
+        font-size: 12px;
+        font-weight: 400;
+        line-height: 1.35;
+        text-align: left;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      #zhipin-auto-greeting-root .za-daily-count-value,
+      #zhipin-auto-greeting-root .za-daily-count-limit {
+        color: #fff;
+        font-weight: 700;
+        font-variant-numeric: tabular-nums;
+      }
+      #zhipin-auto-greeting-root .za-header-stack {
+        min-width: 0;
+        margin-left: 0;
+        margin-right: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        justify-self: end;
+      }
+      #zhipin-auto-greeting-root .za-control-actions {
+        flex: 0 0 auto;
+        display: flex;
+        gap: 8px;
+      }
+      #zhipin-auto-greeting-root .za-header-icon-actions {
+        position: absolute;
+        top: 50%;
+        right: 6px;
+        transform: translateY(-50%);
+        z-index: 2;
+        width: 76px;
+        min-width: 76px;
+        display: flex;
+        align-items: center;
+        justify-content: flex-end;
+        justify-self: end;
+        gap: 4px;
+      }
+      #zhipin-auto-greeting-root.za-open .za-toggle {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        right: min(var(--za-width), calc(100vw - 24px));
+        z-index: 4;
+        border-right: 1px solid rgba(255, 255, 255, 0.35);
+      }
+      #zhipin-auto-greeting-root .za-header .za-icon-btn,
+      #zhipin-auto-greeting-root .za-header .za-feature-button {
+        width: 36px;
+        min-width: 36px;
+        height: 36px;
+        min-height: 36px;
+        padding: 0;
+        border: 0;
+        border-radius: 50%;
+        background: transparent;
+        color: #fff;
+        box-shadow: none;
+      }
+      #zhipin-auto-greeting-root .za-header .za-icon-btn svg,
+      #zhipin-auto-greeting-root .za-header .za-feature-button svg {
+        width: 15px;
+        height: 15px;
+        fill: currentColor;
+      }
+      #zhipin-auto-greeting-root .za-header .za-icon-btn:hover,
+      #zhipin-auto-greeting-root .za-header .za-feature-button:hover {
+        background: rgba(255, 255, 255, 0.14);
+      }
+      #zhipin-auto-greeting-root .za-header .za-icon-btn:focus-visible,
+      #zhipin-auto-greeting-root .za-header .za-feature-button:focus-visible {
+        outline: 3px solid rgba(255, 255, 255, 0.9);
+        outline-offset: 2px;
+      }
+      #zhipin-auto-greeting-root .za-header .za-control-actions button {
+        position: relative;
+        isolation: isolate;
+        width: 60px;
+        min-width: 60px;
+        max-width: 60px;
+        height: 38px;
+        min-height: 38px;
+        padding: 0;
+        border: 0;
+        border-radius: 8px;
+        background: transparent;
+        font-size: 13px;
+        font-weight: 600;
+        line-height: 1;
+      }
+      #zhipin-auto-greeting-root .za-header .za-control-actions button::before {
+        content: "";
+        position: absolute;
+        inset: 4px;
+        z-index: -1;
+        border: 1px solid transparent;
+        border-radius: 7px;
+      }
+      #zhipin-auto-greeting-root .za-header .za-control-actions .za-primary::before {
+        border-color: rgba(255, 255, 255, 0.9);
+        background: #fff;
+      }
+      #zhipin-auto-greeting-root .za-header .za-control-actions .za-danger::before {
+        border-color: rgba(255, 255, 255, 0.62);
+        background: rgba(0, 0, 0, 0.12);
+      }
+      #zhipin-auto-greeting-root .za-header .za-control-actions .za-primary {
+        border-color: transparent;
+        background: transparent;
+        color: var(--za-primary);
+        box-shadow: none;
+      }
+      #zhipin-auto-greeting-root .za-header .za-control-actions .za-danger {
+        border-color: transparent;
+        background: transparent;
+        color: #fff;
+        box-shadow: none;
+      }
+      #zhipin-auto-greeting-root .za-header .za-control-actions button:disabled::before {
+        opacity: 0.5;
+      }
+      #zhipin-auto-greeting-root .za-header .za-control-actions button {
+        transition: background-color 140ms ease, border-color 140ms ease, color 140ms ease, box-shadow 140ms ease, transform 100ms ease;
+      }
+      #zhipin-auto-greeting-root .za-header .za-control-actions .za-primary:disabled::before {
+        border-color: rgba(255, 255, 255, 0.45);
+        background: rgba(255, 255, 255, 0.4);
+      }
+      #zhipin-auto-greeting-root .za-header .za-control-actions .za-primary:disabled {
+        color: rgba(0, 166, 167, 0.7);
+        cursor: not-allowed;
+      }
+      #zhipin-auto-greeting-root .za-header .za-control-actions .za-danger[data-state="enabled"]::before {
+        border-color: rgba(255, 255, 255, 0.58);
+        background: rgba(0, 0, 0, 0.1);
+      }
+      #zhipin-auto-greeting-root .za-header .za-control-actions .za-danger[data-state="enabled"] {
+        color: rgba(255, 255, 255, 0.92);
+      }
+      #zhipin-auto-greeting-root .za-header .za-control-actions .za-danger[data-state="selected"]::before {
+        border-color: #fff;
+        background: #fff;
+        box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.24), 0 3px 8px rgba(0, 0, 0, 0.16);
+      }
+      #zhipin-auto-greeting-root .za-header .za-control-actions .za-danger[data-state="selected"] {
+        color: var(--za-primary);
+        font-weight: 700;
+      }
+      #zhipin-auto-greeting-root .za-header .za-control-actions .za-danger:not(:disabled):hover::before {
+        background: rgba(255, 255, 255, 0.22);
+        border-color: rgba(255, 255, 255, 0.85);
+      }
+      #zhipin-auto-greeting-root .za-header .za-control-actions .za-danger[data-state="selected"]:hover::before {
+        background: #f2ffff;
+      }
+      #zhipin-auto-greeting-root .za-header .za-control-actions .za-danger:disabled::before {
+        border-style: dashed;
+        border-color: rgba(255, 255, 255, 0.28);
+        background: rgba(0, 0, 0, 0.04);
+        opacity: 0.5;
+      }
+      #zhipin-auto-greeting-root .za-header .za-control-actions .za-danger:disabled {
+        color: rgba(255, 255, 255, 0.48);
+        cursor: not-allowed;
+      }
+      #zhipin-auto-greeting-root .za-header .za-control-actions button:not(:disabled):active {
+        transform: translateY(1px);
+      }
+      #zhipin-auto-greeting-root .za-header .za-control-actions button:focus-visible {
+        outline: 3px solid rgba(255, 255, 255, 0.9);
+        outline-offset: 2px;
+      }
+      #zhipin-auto-greeting-root .za-feature-panel {
+        top: calc(var(--za-header-height, 64px) + 10px);
+        border-radius: 6px;
+      }
+      #zhipin-auto-greeting-root .za-feature-panel-close {
+        width: 44px;
+        min-width: 44px;
+        height: 44px;
+        min-height: 44px;
+        padding: 0;
+        border-radius: 8px;
+      }
+      #zhipin-auto-greeting-root .za-feature-panel-close svg {
+        width: 20px;
+        height: 20px;
+        fill: currentColor;
+      }
+      #zhipin-auto-greeting-root .za-monitor-card {
+        flex: 0 0 auto;
+        margin: 10px 12px 0;
+        padding: 10px 12px;
+        border: 1px solid var(--za-divider, var(--za-border));
+        border-radius: 6px;
+        background: var(--za-surface, var(--za-bg));
+        color: var(--za-muted);
+        font-size: 11px;
+        box-shadow: 0 1px 3px rgba(0, 0, 0, 0.12);
+      }
+      #zhipin-auto-greeting-root .za-realtime-log {
+        display: flex;
+        align-items: flex-start;
+        gap: 4px;
+        min-height: 24px;
+        margin-bottom: 8px;
+        padding-left: 8px;
+        border-left: 3px solid var(--za-primary);
+        color: var(--za-text);
+        line-height: 1.5;
+      }
+      #zhipin-auto-greeting-root .za-realtime-log-label {
+        flex: 0 0 auto;
+        color: var(--za-muted);
+        font-weight: 600;
+      }
+      #zhipin-auto-greeting-root .za-monitor-card .za-status {
+        display: block;
+        position: static;
+        flex: 1 1 auto;
+        min-width: 0;
+        margin: 0;
+        padding: 0;
+        border: 0;
+        border-radius: 0;
+        background: transparent;
+        box-shadow: none;
+        color: var(--za-text);
+        font-size: 12px;
+        font-weight: 500;
+        overflow-wrap: anywhere;
+        word-break: break-word;
+      }
+      #zhipin-auto-greeting-root .za-realtime-log[data-type="ok"] { border-left-color: #12b76a; }
+      #zhipin-auto-greeting-root .za-realtime-log[data-type="warn"] { border-left-color: #f79009; }
+      #zhipin-auto-greeting-root .za-realtime-log[data-type="error"] { border-left-color: var(--za-danger); }
+      #zhipin-auto-greeting-root .za-monitor-card .za-guard-grid strong {
+        font-variant-numeric: tabular-nums;
+      }
+      #zhipin-auto-greeting-root .za-section {
+        margin: 6px 10px 0;
+        padding: 0 2px;
+        border: 0;
+        border-radius: 0;
+        background: transparent;
+        box-shadow: none;
+      }
+      #zhipin-auto-greeting-root .za-section + .za-section {
+        margin-top: 2px;
+        padding-top: 0;
+      }
+      #zhipin-auto-greeting-root .za-monitor-card + .za-section {
+        margin-top: 8px;
+        padding-top: 0;
+      }
+      #zhipin-auto-greeting-root .za-panel {
+        padding-bottom: 16px;
+      }
+      #zhipin-auto-greeting-root h3 {
+        padding: 0 2px;
+        border-top: 1px solid var(--za-divider, var(--za-border));
+        border-bottom: 0;
+        color: var(--za-primary);
+        font-size: 16px;
+        font-weight: 700;
+      }
+      #zhipin-auto-greeting-root .za-section[data-feature-section="greeting"] > h3 {
+        border-top: 0;
+      }
+      #zhipin-auto-greeting-root .za-section-toggle {
+        min-height: 44px;
+        padding: 8px 2px;
+        border-radius: 0;
+      }
+      #zhipin-auto-greeting-root .za-section-content {
+        display: grid;
+        grid-template-rows: 1fr;
+        opacity: 1;
+        transition: grid-template-rows 220ms ease, opacity 160ms ease;
+      }
+      #zhipin-auto-greeting-root .za-section-content-inner {
+        min-height: 0;
+        overflow: visible;
+      }
+      #zhipin-auto-greeting-root .za-section-content.za-section-animating,
+      #zhipin-auto-greeting-root .za-section-content.za-section-animating > .za-section-content-inner {
+        overflow: hidden;
+      }
+      #zhipin-auto-greeting-root .za-section-collapsed > .za-section-content {
+        display: grid;
+        grid-template-rows: 0fr;
+        overflow: hidden;
+        opacity: 0;
+        pointer-events: none;
+      }
+      #zhipin-auto-greeting-root .za-section-collapsed > .za-section-content > .za-section-content-inner {
+        overflow: hidden;
+      }
+      #zhipin-auto-greeting-root .za-subsection {
+        margin-top: 8px;
+        padding: 12px;
+        border: 1px solid var(--za-divider, var(--za-border));
+        border-radius: 6px;
+        background: var(--za-surface, var(--za-bg));
+        box-shadow: 0 1px 2px rgba(0, 0, 0, 0.08);
+      }
+      #zhipin-auto-greeting-root .za-about-card,
+      #zhipin-auto-greeting-root .za-restricted-banner {
+        border-radius: 6px;
+      }
+      #zhipin-auto-greeting-root .za-subsection + .za-subsection {
+        margin-top: 8px;
+      }
+      #zhipin-auto-greeting-root .za-subsection-title {
+        margin-bottom: 8px;
+        color: var(--za-text);
+        font-size: 13px;
+        font-weight: 600;
+      }
+      @media (max-width: 520px) {
+        #zhipin-auto-greeting-root .za-header-row {
+          padding-left: 10px;
+          padding-right: 92px;
+        }
+        #zhipin-auto-greeting-root .za-header {
+          padding-left: 0;
+          padding-right: 0;
+        }
+      }
+      @media (max-width: 360px) {
+        #zhipin-auto-greeting-root .za-grid-2,
+        #zhipin-auto-greeting-root .za-monitor-card .za-guard-grid {
+          grid-template-columns: 1fr;
+        }
+      }
       @media (prefers-reduced-motion: reduce) {
+        #zhipin-auto-greeting-root .za-section-content {
+          transition: none;
+        }
         #zhipin-auto-greeting-root .za-halt-alert-backdrop,
         #zhipin-auto-greeting-root .za-halt-alert-pulse {
           animation: none;
